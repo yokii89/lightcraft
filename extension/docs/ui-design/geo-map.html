@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>按地理位置分类 · 地图视图 · UI 设计稿</title>
+<style>html,body{margin:0;padding:0;background:#101010;}</style>
+</head>
+<body>
+<div class="gmp">
+<style>
+
+  .gmp{
+    --chrome:#2d2d2d; --canvas:#1c1c1c; --grid:#0f0f0f; --cell:#1c1c1c;
+    --inset:#232323; --field:#222; --field-border:#3c3c3c; --button:#242424;
+    --button-border:#4c4c4c; --hover:#3a3a3a; --pressed:#3f3f3f;
+    --text:#e2e2e2; --label:#bcbcbc; --dim:#8e8e8e; --disabled:#5c5c5c;
+    --icon:#9a9a9a; --track:#5a5a5a; --accent:#0165dd; --accent-soft:rgba(1,101,221,.18);
+    --accent-text:#7fb3ff; --caution:#e3a83c; --danger:#e04a4a; --ok:#68b66c;
+    --divider:#1c1c1c;
+    --sea:#141414; --land:#242424; --land-edge:#4a4a4a; --graticule:rgba(255,255,255,.045);
+  }
+  .gmp *{box-sizing:border-box;}
+  .gmp{margin:0;padding:0;background:#101010;color:var(--text);
+    font-family:"Inter","Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  .gmp{padding:22px 22px 60px;}
+  .gmp .proto-bar{max-width:1220px;margin:0 auto 14px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;
+    font-size:12px;color:var(--dim);}
+  .gmp .proto-bar .group{display:flex;align-items:center;gap:6px;}
+  .gmp .proto-bar .group > span{color:var(--dim);margin-right:2px;}
+  .gmp .tbtn{background:var(--button);border:1px solid var(--button-border);color:var(--label);
+    font:inherit;font-size:12px;padding:5px 10px;border-radius:4px;cursor:pointer;}
+  .gmp .tbtn:hover{background:var(--hover);color:var(--text);}
+  .gmp .tbtn.on{background:var(--pressed);color:var(--text);border-color:#6a6a6a;}
+  .gmp .tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+
+  /* ---------- app frame ---------- */
+  .gmp .app{max-width:1220px;margin:0 auto;height:840px;background:var(--canvas);
+    border:1px solid #333;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;
+    box-shadow:0 18px 60px rgba(0,0,0,.55);}
+  .gmp .topbar{height:42px;flex:0 0 42px;background:var(--chrome);display:flex;align-items:center;
+    gap:14px;padding:0 14px;border-bottom:1px solid var(--divider);}
+  .gmp .brand{font-size:12.5px;font-weight:600;letter-spacing:.4px;color:var(--text);}
+  .gmp .brand span{color:var(--dim);font-weight:400;margin-left:8px;letter-spacing:0;}
+  .gmp .topbar .mods{display:flex;gap:2px;margin-left:18px;}
+  .gmp .mods .mod{font-size:12px;color:var(--dim);padding:5px 11px;border-radius:4px;cursor:default;}
+  .gmp .mods .mod.on{background:#3a3a3a;color:var(--text);}
+  .gmp .topbar .spacer{flex:1;}
+  .gmp .topbar .hint{font-size:11px;color:var(--disabled);}
+
+  .gmp .workspace{flex:1;display:flex;min-height:0;}
+  .gmp .toolstrip{width:48px;flex:0 0 48px;background:var(--chrome);border-right:1px solid var(--divider);
+    display:flex;flex-direction:column;align-items:center;padding-top:12px;gap:8px;}
+  .gmp .toolstrip .tool{width:32px;height:32px;border-radius:4px;display:grid;place-items:center;color:var(--icon);}
+  .gmp .toolstrip .tool.on{background:var(--pressed);color:var(--text);}
+  .gmp .toolstrip svg{width:17px;height:17px;display:block;}
+
+  .gmp .library{width:236px;flex:0 0 236px;background:var(--chrome);border-right:1px solid var(--divider);
+    padding:10px 10px 0;overflow:hidden;}
+  .gmp .lib-title{font-size:10.5px;letter-spacing:.8px;color:var(--dim);text-transform:uppercase;margin:6px 2px 8px;}
+  .gmp .lib-row{display:flex;align-items:center;gap:8px;height:27px;padding:0 7px;border-radius:4px;
+    font-size:12px;color:var(--label);}
+  .gmp .lib-row.on{background:var(--pressed);color:var(--text);}
+  .gmp .lib-row .n{margin-left:auto;font-size:11px;color:var(--dim);}
+  .gmp .lib-dot{width:6px;height:6px;border-radius:50%;background:#5d5d5d;}
+  .gmp .lib-dot.blue{background:#4d84c8;}
+  .gmp .lib-dot.green{background:#5d9b66;}
+  .gmp .lib-sec{margin-top:16px;border-top:1px solid #262626;padding-top:10px;}
+
+  .gmp .canvas-area{flex:1;min-width:0;background:var(--grid);position:relative;overflow:hidden;}
+  .gmp .canvas-head{height:34px;display:flex;align-items:center;padding:0 14px;gap:10px;
+    background:linear-gradient(#1c1c1c,#181818);border-bottom:1px solid #222;font-size:11.5px;color:var(--dim);}
+  .gmp .cgrid{position:absolute;inset:34px 0 0 0;padding:14px;display:grid;
+    grid-template-columns:repeat(4,1fr);gap:10px;align-content:start;}
+  .gmp .ph{border-radius:4px;aspect-ratio:3/2;position:relative;overflow:hidden;
+    background:#242424;border:1px solid #2c2c2c;filter:saturate(.55) brightness(.72);}
+  .gmp .ph::after{content:"";position:absolute;inset:0;
+    background:
+      radial-gradient(120% 90% at 22% 18%, rgba(255,255,255,.22), transparent 45%),
+      radial-gradient(80% 70% at 78% 72%, rgba(0,0,0,.45), transparent 60%);
+    mix-blend-mode:soft-light;}
+  .gmp .ph.a{background:linear-gradient(160deg,#5b6d7a,#2c3a44 55%,#1b2329);}
+  .gmp .ph.b{background:linear-gradient(150deg,#8a7866,#4a3c31 60%,#241d18);}
+  .gmp .ph.c{background:linear-gradient(155deg,#4e6b55,#2b4033 58%,#16211a);}
+  .gmp .ph.d{background:linear-gradient(150deg,#6d6478,#3a3344 60%,#1d1a23);}
+  .gmp .ph.e{background:linear-gradient(150deg,#7a6f5c,#4a4234 60%,#241f18);}
+  .gmp .ph.f{background:linear-gradient(150deg,#5a6a80,#303b4b 60%,#1a2028);}
+  .gmp .ph.g{background:linear-gradient(150deg,#80695f,#46362f 60%,#221a17);}
+  .gmp .ph.h{background:linear-gradient(150deg,#5f7a76,#334441 60%,#19211f);}
+
+  /* loupe：中间栏单图展示（点击地图缩略图后） */
+  .gmp .loupe{position:absolute;inset:34px 0 0 0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:12px;background:
+    radial-gradient(60% 60% at 50% 40%, #171717, var(--grid));}
+  .gmp .loupe[hidden]{display:none;}
+  .gmp .loupe-back{position:absolute;top:10px;left:12px;height:26px;background:var(--button);
+    border:1px solid var(--button-border);border-radius:4px;color:var(--label);font:inherit;font-size:11.5px;
+    padding:0 10px;cursor:pointer;}
+  .gmp .loupe-back:hover{background:var(--hover);color:var(--text);}
+  .gmp .loupe-img{width:min(72%,620px);filter:none !important;border-radius:6px;
+    box-shadow:0 14px 50px rgba(0,0,0,.6);}
+  .gmp .loupe-meta{font-size:11.5px;color:var(--label);}
+  .gmp .loupe-meta b{color:var(--accent-text);font-weight:500;}
+  .gmp .loupe-meta .sub{color:var(--dim);font-size:10.5px;margin-top:3px;text-align:center;}
+
+  /* ---------- extension dock ---------- */
+  .gmp .dock{flex:0 0 var(--dock-w,520px);width:var(--dock-w,520px);background:var(--chrome);
+    border-left:1px solid #191919;display:flex;flex-direction:column;min-height:0;
+    transition:flex-basis .18s ease,width .18s ease;}
+  .gmp .dock-head{height:32px;flex:0 0 32px;display:flex;align-items:center;gap:8px;padding:0 10px;
+    border-bottom:1px solid var(--divider);}
+  .gmp .dock-head .t{font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim);}
+  .gmp .dock-head .close{margin-left:auto;color:var(--dim);font-size:15px;line-height:1;cursor:default;}
+  .gmp .dock-tabs{height:30px;flex:0 0 30px;display:flex;align-items:stretch;gap:0;padding:0 10px;
+    border-bottom:1px solid var(--divider);}
+  .gmp .dock-tab{font-size:12px;color:var(--dim);padding:0 10px;display:flex;align-items:center;
+    border-bottom:2px solid transparent;cursor:pointer;}
+  .gmp .dock-tab.on{color:var(--text);border-bottom-color:var(--accent);}
+  .gmp .page{flex:1;min-height:0;overflow-y:auto;padding:12px 12px 14px;scrollbar-width:thin;
+    scrollbar-color:#4a4a4a transparent;display:flex;flex-direction:column;}
+  .gmp .page::-webkit-scrollbar{width:8px;}
+  .gmp .page::-webkit-scrollbar-thumb{background:#4a4a4a;border-radius:4px;}
+  .gmp .page > *{flex:0 0 auto;}
+
+  .gmp .page-title{font-size:14px;font-weight:600;color:var(--text);margin:2px 0 3px;}
+  .gmp .page-sub{font-size:11px;line-height:1.5;color:var(--dim);margin-bottom:12px;}
+
+  .gmp .card{background:var(--inset);border:1px solid #303030;border-radius:5px;padding:10px;margin-bottom:10px;}
+  .gmp .sec{display:flex;align-items:center;gap:6px;margin:2px 0 8px;}
+  .gmp .sec .chev{width:12px;height:12px;color:var(--dim);display:grid;place-items:center;cursor:pointer;
+    transition:transform .15s;}
+  .gmp .sec .chev svg{width:9px;height:9px;}
+  .gmp .sec .name{font-size:11px;font-weight:600;letter-spacing:.6px;color:var(--label);text-transform:uppercase;
+    cursor:pointer;user-select:none;}
+  .gmp .sec .right{margin-left:auto;font-size:10px;color:var(--dim);}
+
+  .gmp .status{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--label);margin-bottom:9px;}
+  .gmp .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 2px rgba(104,182,108,.16);}
+  .gmp .status .ver{color:var(--dim);}
+  .gmp .status .link{margin-left:auto;color:var(--accent-text);font-size:11px;cursor:pointer;user-select:none;}
+  .gmp .status .link:hover{text-decoration:underline;}
+
+  .gmp .field-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+  .gmp .field-row:last-child{margin-bottom:0;}
+  .gmp .field-row label{font-size:11.5px;color:var(--dim);width:64px;flex:0 0 64px;}
+  .gmp .input{flex:1;min-width:0;height:26px;background:var(--field);border:1px solid var(--field-border);
+    border-radius:3px;color:var(--text);font:inherit;font-size:11.5px;padding:0 7px;outline:none;}
+  .gmp .input:focus{border-color:var(--accent);}
+  .gmp .hint-line{font-size:10.5px;line-height:1.5;color:var(--dim);margin-top:7px;}
+
+  .gmp .seg{display:flex;background:var(--field);border:1px solid var(--field-border);border-radius:3px;overflow:hidden;}
+  .gmp .seg button{flex:1;background:transparent;border:0;border-right:1px solid var(--field-border);
+    color:var(--dim);font:inherit;font-size:11px;padding:6px 2px;cursor:pointer;line-height:1.25;}
+  .gmp .seg button:last-child{border-right:0;}
+  .gmp .seg button:hover{background:#2a2a2a;color:var(--label);}
+  .gmp .seg button.on{background:var(--pressed);color:var(--text);}
+  .gmp .seg button small{display:block;font-size:10px;color:var(--dim);margin-top:1px;}
+  .gmp .seg button.on small{color:var(--label);}
+
+  .gmp .path-preview{font-size:10.5px;color:var(--dim);background:#1b1b1b;border:1px solid #2e2e2e;
+    border-radius:3px;padding:5px 7px;margin-top:8px;}
+  .gmp .path-preview b{color:var(--accent-text);font-weight:500;}
+
+  .gmp .check{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--label);cursor:pointer;line-height:1.45;}
+  .gmp .check input{display:none;}
+  .gmp .box{width:13px;height:13px;flex:0 0 13px;border:1px solid var(--field-border);border-radius:3px;
+    background:var(--field);position:relative;}
+  .gmp .check input:checked + .box{background:var(--accent);border-color:var(--accent);}
+  .gmp .check input:checked + .box::after{content:"";position:absolute;left:3.5px;top:1px;width:4px;height:7px;
+    border:solid #fff;border-width:0 1.5px 1.5px 0;transform:rotate(42deg);}
+
+  .gmp .primary{width:100%;height:30px;background:var(--accent);border:1px solid #1a7af0;border-radius:4px;
+    color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer;margin-top:2px;}
+  .gmp .primary:hover{background:#0d72ee;}
+  .gmp .secondary{height:27px;background:var(--button);border:1px solid var(--button-border);border-radius:4px;
+    color:var(--label);font:inherit;font-size:11.5px;padding:0 12px;cursor:pointer;}
+  .gmp .secondary:hover{background:var(--hover);color:var(--text);}
+
+  /* ---------- state panels ---------- */
+  .gmp .state{display:none;}
+  .gmp .state.on{display:block;}
+  /* 地图评审：地图即主视图，撑满面板 */
+  .gmp .state[data-panel="review"].on{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;}
+
+  /* ---------- review summary ---------- */
+  .gmp .review-sum{display:flex;align-items:flex-start;gap:8px;margin-bottom:9px;}
+  .gmp .review-sum .t{font-size:11.5px;color:var(--label);line-height:1.4;}
+  .gmp .review-sum .t b{color:var(--text);font-weight:600;}
+  .gmp .review-sum .extra{display:block;font-size:10px;color:var(--dim);margin-top:2px;}
+  .gmp .review-sum .acts{margin-left:auto;display:flex;gap:6px;flex:0 0 auto;}
+  .gmp .review-sum .acts .secondary{height:24px;padding:0 8px;font-size:10.5px;}
+
+  /* ---------- map card（主视图） ---------- */
+  .gmp .map-card{background:var(--inset);border:1px solid #303030;border-radius:5px;padding:10px;
+    margin-bottom:10px;display:flex;flex-direction:column;min-height:0;flex:1 1 auto;}
+  .gmp .map-card.closed{flex:0 0 auto;}
+  .gmp .map-card.closed .map-box,
+  .gmp .map-card.closed .map-foot{display:none;}
+  .gmp .map-card.closed .sec .chev{transform:rotate(-90deg);}
+  .gmp .map-box{position:relative;flex:1 1 auto;min-height:300px;border:1px solid #2c2c2c;border-radius:4px;
+    overflow:hidden;background:var(--sea);cursor:grab;}
+  .gmp .map-box.dragging{cursor:grabbing;}
+  .gmp .map-svg{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  .gmp .overlay{position:absolute;inset:0;z-index:2;}
+  .gmp .map-foot{flex:0 0 auto;display:flex;justify-content:space-between;gap:10px;font-size:10px;color:var(--dim);
+    padding-top:7px;line-height:1.4;}
+  .gmp .map-foot .r{flex:0 0 auto;color:var(--disabled);cursor:help;}
+  .gmp .tip{position:absolute;pointer-events:none;background:#111;border:1px solid #4a4a4a;padding:4px 8px;
+    font-size:10.5px;border-radius:3px;color:var(--text);z-index:9;white-space:nowrap;display:none;
+    box-shadow:0 4px 14px rgba(0,0,0,.5);line-height:1.4;}
+  .gmp .tip b{color:var(--accent-text);font-weight:500;}
+
+  .gmp .grat{stroke:var(--graticule);stroke-width:1;}
+  .gmp .coast{fill:var(--land);stroke:var(--land-edge);stroke-width:1.2;stroke-linejoin:round;}
+  .gmp .island{fill:var(--land);stroke:var(--land-edge);stroke-width:1;}
+
+  /* 地图内浮层控件 */
+  .gmp .mtools{position:absolute;top:8px;left:8px;display:flex;gap:6px;z-index:5;flex-wrap:wrap;}
+  .gmp .mzoom{position:absolute;top:8px;right:8px;display:flex;gap:6px;z-index:5;}
+  .gmp .chip-btn{background:var(--button);border:1px solid var(--button-border);color:var(--label);
+    font:inherit;font-size:10.5px;padding:3px 9px;border-radius:3px;cursor:pointer;}
+  .gmp .chip-btn:hover{background:var(--hover);color:var(--text);}
+  .gmp .chip-btn.on{background:var(--pressed);color:var(--text);border-color:#6a6a6a;}
+  .gmp .zbtn{width:26px;height:26px;border-radius:4px;background:var(--button);border:1px solid var(--button-border);
+    color:var(--label);font-size:14px;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0;}
+  .gmp .zbtn:hover{background:var(--hover);color:var(--text);}
+  .gmp .zbtn svg{width:11px;height:11px;}
+
+  /* 气泡（HTML 覆盖层，屏幕等大） */
+  .gmp .bub{position:absolute;transform:translate(-50%,-50%);border-radius:50%;cursor:pointer;
+    background:rgba(1,101,221,.9);border:1px solid rgba(255,255,255,.72);display:grid;place-items:center;
+    color:#fff;font-size:10px;font-variant-numeric:tabular-nums;transition:filter .1s;}
+  .gmp .bub.haloed{box-shadow:0 0 0 5px rgba(1,101,221,.15);}
+  .gmp .bub:hover{filter:brightness(1.2);}
+  .gmp .bub.sel{box-shadow:0 0 0 3px var(--accent-text),0 0 0 7px rgba(1,101,221,.2);}
+  .gmp .bub.off{filter:grayscale(1);opacity:.45;}
+
+  /* 缩略图（放大后出现） */
+  .gmp .mthumb{position:absolute;transform:translate(-50%,-50%);cursor:pointer;border-radius:4px;
+    border:2px solid rgba(255,255,255,.4);overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.5);z-index:2;}
+  .gmp .mthumb .ph{position:absolute;inset:0;width:100%;height:100%;aspect-ratio:auto;}
+  .gmp .mthumb:hover{border-color:#fff;}
+  .gmp .mthumb.sel{border-color:var(--accent-text);box-shadow:0 0 0 2px rgba(1,101,221,.55),0 2px 8px rgba(0,0,0,.5);}
+  .gmp .tlabel{position:absolute;transform:translate(-50%,0);font-size:10.5px;color:var(--label);
+    background:rgba(17,17,17,.78);border:1px solid #333;border-radius:3px;padding:1px 6px;
+    pointer-events:none;white-space:nowrap;z-index:1;}
+
+  /* 气泡弹出卡（代替列表的每地操作） */
+  .gmp .popup{position:absolute;z-index:8;width:178px;background:#1b1b1b;border:1px solid #4a4a4a;border-radius:5px;
+    padding:8px 9px;box-shadow:0 10px 28px rgba(0,0,0,.55);}
+  .gmp .popup[hidden]{display:none;}
+  .gmp .pp-head{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text);font-weight:600;}
+  .gmp .pp-close{margin-left:auto;color:var(--dim);cursor:pointer;font-size:13px;line-height:1;}
+  .gmp .pp-close:hover{color:var(--text);}
+  .gmp .pp-path{font-size:10px;color:var(--dim);margin:4px 0 8px;}
+  .gmp .pp-acts{display:flex;align-items:center;justify-content:space-between;gap:6px;}
+
+  /* 南海诸岛 inset + 示意标注（固定屏幕位置） */
+  .gmp .map-inset{position:absolute;right:10px;bottom:8px;width:92px;pointer-events:none;z-index:3;}
+  .gmp .map-inset svg{width:100%;height:auto;display:block;}
+  .gmp .inset-frame{fill:rgba(20,20,20,.88);stroke:#3c3c3c;stroke-width:1;}
+  .gmp .inset-line{fill:none;stroke:#6a6a6a;stroke-width:1.1;stroke-dasharray:5 4;}
+  .gmp .inset-txt{font-size:11px;fill:var(--dim);font-family:inherit;}
+  .gmp .map-note{position:absolute;left:10px;bottom:8px;font-size:9.5px;color:var(--disabled);z-index:3;
+    pointer-events:none;font-family:inherit;}
+
+  /* ---------- done ---------- */
+  .gmp .done-card{background:var(--inset);border:1px solid #303030;border-radius:5px;padding:12px;margin-bottom:10px;}
+  .gmp .done-title{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text);margin-bottom:6px;}
+  .gmp .done-title .tick{width:16px;height:16px;border-radius:50%;background:rgba(104,182,108,.16);
+    color:var(--ok);display:grid;place-items:center;font-size:11px;}
+  .gmp .done-meta{font-size:11px;color:var(--dim);line-height:1.6;}
+  .gmp .done-actions{display:flex;gap:8px;margin-top:11px;}
+
+  /* ---------- docs below frame ---------- */
+  .gmp .docs{max-width:1220px;margin:26px auto 0;display:grid;grid-template-columns:1.1fr .9fr;gap:16px;}
+  @media (max-width:980px){.docs{grid-template-columns:1fr;}}
+  .gmp .doc{background:#171717;border:1px solid #2a2a2a;border-radius:8px;padding:16px 18px;}
+  .gmp .doc h2{font-size:13px;font-weight:600;color:var(--text);margin:0 0 10px;letter-spacing:.2px;}
+  .gmp .doc h3{font-size:11px;font-weight:600;color:var(--label);margin:14px 0 6px;letter-spacing:.5px;text-transform:uppercase;}
+  .gmp .doc p, .gmp .doc li{font-size:11.5px;line-height:1.65;color:var(--dim);}
+  .gmp .doc ul{margin:0;padding-left:16px;}
+  .gmp .doc li{margin-bottom:4px;}
+  .gmp .doc b{color:var(--label);font-weight:500;}
+  .gmp .doc .accent{color:var(--accent-text);}
+  .gmp .doc .warn{color:var(--caution);}
+  .gmp table{width:100%;border-collapse:collapse;font-size:11px;}
+  .gmp th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid #2c2c2c;white-space:nowrap;}
+  .gmp td{padding:6px 8px;border-bottom:1px solid #222;color:var(--label);vertical-align:top;line-height:1.5;}
+  .gmp td.src{color:var(--dim);font-family:ui-monospace,Consolas,monospace;font-size:10.5px;}
+  .gmp td.zh{color:var(--text);white-space:nowrap;}
+  .gmp tr:last-child td{border-bottom:0;}
+  .gmp .spec-kv{display:grid;grid-template-columns:86px 1fr;gap:4px 10px;font-size:11.5px;line-height:1.6;}
+  .gmp .spec-kv .k{color:var(--dim);}
+  .gmp .spec-kv .v{color:var(--label);}
+  .gmp .tag{display:inline-block;font-size:10px;color:var(--accent-text);background:var(--accent-soft);
+    border:1px solid rgba(1,101,221,.3);border-radius:3px;padding:1px 5px;margin-right:4px;}
+  .gmp .swatches{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;}
+  .gmp .sw{width:34px;height:22px;border-radius:3px;border:1px solid #333;position:relative;}
+  .gmp .sw span{position:absolute;left:0;right:0;bottom:-15px;text-align:center;font-size:9px;color:var(--disabled);}
+</style>
+
+
+<div class="proto-bar">
+  <div class="group"><span>原型状态</span>
+    <button class="tbtn" data-state="idle">就绪</button>
+    <button class="tbtn on" data-state="review">地图评审</button>
+    <button class="tbtn" data-state="done">已完成</button>
+  </div>
+  <div class="group"><span>面板宽度</span>
+    <button class="tbtn" data-width="320">320</button>
+    <button class="tbtn" data-width="360">360</button>
+    <button class="tbtn on" data-width="520">520</button>
+    <button class="tbtn" data-width="720">720</button>
+  </div>
+  <div class="group" style="margin-left:auto;color:var(--disabled);font-size:11px;">滚轮缩放 / 拖动平移 / 双击放大 · 点气泡弹出地点卡 · 放大出现缩略图，点击在中间栏查看</div>
+</div>
+
+<div class="app" id="app">
+  <div class="topbar">
+    <div class="brand">LightCraft<span>图库</span></div>
+    <div class="mods">
+      <div class="mod on">图库</div>
+      <div class="mod">修改照片</div>
+      <div class="mod">打印</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="hint">原型 · 地理位置分类地图视图</div>
+  </div>
+
+  <div class="workspace">
+    <div class="toolstrip" aria-hidden="true">
+      <div class="tool on">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      </div>
+      <div class="tool">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 17V7l7-3 7 3v10"/><path d="M4 17h16"/><path d="M9 17v-5h6v5"/></svg>
+      </div>
+      <div class="tool">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>
+      </div>
+    </div>
+
+    <div class="library" aria-hidden="true">
+      <div class="lib-title">图库</div>
+      <div class="lib-row on"><span class="lib-dot blue"></span>所有照片<span class="n">1,204</span></div>
+      <div class="lib-row"><span class="lib-dot"></span>上次导入<span class="n">128</span></div>
+      <div class="lib-row"><span class="lib-dot green"></span>留用<span class="n">312</span></div>
+      <div class="lib-row"><span class="lib-dot"></span>已加关键字<span class="n">86</span></div>
+      <div class="lib-sec">
+        <div class="lib-title">文件夹</div>
+        <div class="lib-row"><span class="lib-dot"></span>2026-11 川西</div>
+        <div class="lib-row"><span class="lib-dot"></span>2026-10 城市夜景</div>
+      </div>
+      <div class="lib-sec">
+        <div class="lib-title">扩展</div>
+        <div class="lib-row on">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color:#9a9a9a"><path d="M12 21s-6.5-5.4-6.5-10.4A6.5 6.5 0 0 1 12 4a6.5 6.5 0 0 1 6.5 6.6C18.5 15.6 12 21 12 21z"/><circle cx="12" cy="10.5" r="2.2"/></svg>
+          按地理位置分类
+        </div>
+      </div>
+    </div>
+
+    <div class="canvas-area">
+      <div class="canvas-head"><span>所有照片</span><span style="color:var(--disabled)">·</span><span>1,204 张</span></div>
+      <div class="cgrid" id="cgrid">
+        <div class="ph a"></div><div class="ph b"></div><div class="ph c"></div><div class="ph d"></div>
+        <div class="ph e"></div><div class="ph f"></div><div class="ph g"></div><div class="ph h"></div>
+        <div class="ph c"></div><div class="ph d"></div><div class="ph a"></div><div class="ph b"></div>
+      </div>
+      <div class="loupe" id="loupe" hidden>
+        <button class="loupe-back" onclick="closeLoupe()">‹ 返回网格</button>
+        <div class="ph loupe-img" id="loupe-img"></div>
+        <div class="loupe-meta" id="loupe-meta"></div>
+      </div>
+    </div>
+
+    <!-- ================= EXTENSION DOCK ================= -->
+    <div class="dock" id="dock">
+      <div class="dock-head"><span class="t">扩展</span><span class="close">×</span></div>
+      <div class="dock-tabs">
+        <div class="dock-tab on">按地理位置分类</div>
+      </div>
+
+      <div class="page">
+        <div class="page-title">按地理位置分类</div>
+        <div class="page-sub">照片按拍摄地点散布在中国地图上。查找完全离线，位置不出本机。</div>
+
+        <!-- ---------- IDLE ---------- -->
+        <div class="state" data-panel="idle">
+          <div class="card">
+            <div class="sec">
+              <span class="chev"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 4.5 6 7.5 9 4.5"/></svg></span>
+              <span class="name">地名数据</span>
+            </div>
+            <div class="status">
+              <span class="dot"></span><span>已就绪</span><span class="ver">cities15000 · 3.2 MB</span>
+              <span class="link" onclick="flash(this)">重新检查</span>
+            </div>
+            <div class="hint-line">GeoNames CC-BY 4.0 · 离线使用。地名库列出 1.5 万人以上的城镇，更小的地方归到国家或最近的大城。</div>
+          </div>
+
+          <div class="card">
+            <div class="sec">
+              <span class="chev"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 4.5 6 7.5 9 4.5"/></svg></span>
+              <span class="name">范围</span>
+            </div>
+            <div class="seg">
+              <button>选中照片<small>12 张</small></button>
+              <button>当前视图<small>128 张</small></button>
+              <button class="on">整个图库<small>1,204 张</small></button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="sec">
+              <span class="chev"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 4.5 6 7.5 9 4.5"/></svg></span>
+              <span class="name">关键字</span>
+            </div>
+            <div class="field-row">
+              <label for="parent">父级关键字</label>
+              <input class="input" id="parent" value="地点" spellcheck="false">
+            </div>
+            <div class="path-preview">保存为 <b>地点</b>|<b>中国</b>|<b>杭州</b>；无匹配城市的照片只写到国家一层。</div>
+          </div>
+
+          <button class="primary" onclick="setState('review')">开始分类<small>1,204 张</small></button>
+          <div class="hint-line">分类只读 GPS 并查地名库，不写入；之后在地图上逐地确认再写。</div>
+        </div>
+
+        <!-- ---------- REVIEW：地图即主视图 ---------- -->
+        <div class="state on" data-panel="review">
+          <div class="review-sum">
+            <div class="t">待写入 <b id="sum-photos">0</b> 张 · <b id="sum-groups">0</b> 个地点
+              <span class="extra">中国以外 9 张（东京 5 · 河内 4）· 未匹配 43 张 · 无 GPS 103 张 — 不上图，不写入</span>
+            </div>
+            <div class="acts">
+              <button class="secondary" onclick="acceptAll()">全部接受</button>
+              <button class="secondary" onclick="setState('idle')">全部丢弃</button>
+            </div>
+          </div>
+
+          <div class="map-card" id="map-card">
+            <div class="sec">
+              <span class="chev" onclick="toggleMap()"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 4.5 6 7.5 9 4.5"/></svg></span>
+              <span class="name" onclick="toggleMap()">地图</span>
+              <span class="right">中国 · <span id="map-count">0</span> 个地点</span>
+            </div>
+            <div class="map-box" id="map-box">
+              <svg class="map-svg" id="map-svg"></svg>
+              <div class="overlay" id="overlay"></div>
+              <div class="mtools" id="map-chips"></div>
+              <div class="mzoom">
+                <button class="zbtn" onclick="zoomBy(1.5)" title="放大">+</button>
+                <button class="zbtn" onclick="zoomBy(1/1.5)" title="缩小">−</button>
+                <button class="zbtn" onclick="setView(0)" title="复位到全国">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 11 12 4l8 7"/><path d="M6.5 10v9h11v-9"/></svg>
+                </button>
+              </div>
+              <div class="popup" id="popup" hidden></div>
+              <div class="tip" id="map-tip"></div>
+              <div class="map-inset" aria-hidden="true">
+                <svg viewBox="0 0 100 120">
+                  <rect class="inset-frame" x="1" y="1" width="98" height="118" rx="3"/>
+                  <text class="inset-txt" x="50" y="15" text-anchor="middle">南海诸岛</text>
+                  <path class="inset-line" d="M 16 24 C 10 46 10 66 18 84 C 28 100 46 107 62 109 C 76 110 86 103 90 93 C 93 85 93 75 92 67"/>
+                  <circle cx="44" cy="80" r="1.5" fill="#8e8e8e"/><circle cx="54" cy="90" r="1.3" fill="#8e8e8e"/>
+                  <circle cx="65" cy="98" r="1.2" fill="#8e8e8e"/><circle cx="33" cy="66" r="1.2" fill="#8e8e8e"/>
+                  <circle cx="80" cy="52" r="1.1" fill="#8e8e8e"/>
+                </svg>
+              </div>
+              <div class="map-note">边界与地名均为设计示意 · 正式版采用标准边界数据</div>
+            </div>
+            <div class="map-foot">
+              <span>气泡大小 ∝ 照片数 · 滚轮缩放 / 拖动平移 · 放大后出现照片缩略图，点击在中间栏查看</span>
+              <span class="r" title="设计稿用手绘简化边界；正式实现需采用标准中国边界数据并遵守地图审图规定">边界为示意</span>
+            </div>
+          </div>
+
+          <button class="primary" onclick="setState('done')">写入 <span id="btn-count">0</span> 张照片</button>
+        </div>
+
+        <!-- ---------- DONE ---------- -->
+        <div class="state" data-panel="done">
+          <div class="done-card">
+            <div class="done-title"><span class="tick">✓</span>已写入 1,049 张照片</div>
+            <div class="done-meta">1,049 个关键字 · 22 个地点 · 整批一个撤销步骤<br>关键字出现在右侧关键字面板，自动写 XMP 时同步到 sidecar。</div>
+            <div class="done-actions">
+              <button class="secondary" onclick="flash(this)">撤销这一批</button>
+              <button class="secondary" onclick="setState('idle')">继续分类</button>
+            </div>
+          </div>
+          <div class="hint-line">地图视图随评审一起结束；下次分类重新生成。</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="docs">
+  <div class="doc">
+    <h2>规格卡</h2>
+    <div class="spec-kv">
+      <div class="k">入口</div><div class="v">「按地理位置分类」评审阶段：地图即主视图，撑满扩展面板；可整卡收起。</div>
+      <div class="k">范围</div><div class="v">v1 只画<b>中国</b>：国家为中国的分组上图；中国以外、未匹配、无 GPS 不上图（汇总行说明）。</div>
+      <div class="k">投影</div><div class="v">等经纬线性投影（x 按 cos 35° 压缩），正视图朝北、不旋转；无瓦片、无网络、无第三方地图库。</div>
+      <div class="k">缩放</div><div class="v">滚轮（以光标为锚）+ 右上 +/−/复位 按钮 + 双击放大 + 拖动平移；spanLon 62°（全国）→ 1.2°（街区），平移限制在中国范围附近。</div>
+      <div class="k">两级呈现</div><div class="v">spanLon &gt; 9°：地点气泡（r=2.35·√照片数，计数在泡内）；≤ 9°：拆成<b>逐张照片缩略图</b>散在拍摄点周围，随放大变大（34→54 px），每地最多几十张、以「+N」计其余。</div>
+      <div class="k">查看</div><div class="v">点击缩略图 → 该照片在<b>中间栏</b>大图展示（文件名 · 地点 · 距离 · 将写入的关键字路径）；「‹ 返回网格」回到图库网格。</div>
+      <div class="k">地点卡</div><div class="v">点击气泡弹出地点卡（代替列表）：纳入写入勾选、「聚焦」跳转、关闭；点空白处关闭。</div>
+      <div class="k">边界</div><div class="v">原型为手绘简化轮廓 + 海南/台湾 + 南海诸岛 inset（本仓库原创矢量）；<span class="warn">正式实现必须换标准中国边界数据（如自然资源部标准地图服务），示意边界不得随产品发布</span>。</div>
+      <div class="k">性能</div><div class="v">底图 SVG（陆地/经纬网）世界坐标一次生成，缩放/平移只改 viewBox；气泡/缩略图按经纬度重投影定位，rAF 节流。egui 实现同理：Painter 重绘 ≤ 16 ms。</div>
+      <div class="k">落点</div><div class="v">全部在 <span class="tag">extension/src/geo_classify.rs</span>（新增 map 模块）；不改原生代码。</div>
+    </div>
+
+    <h3>交互</h3>
+    <ul>
+      <li>评审页顶部汇总「待写入 X 张 · Y 个地点」+ 全部接受/丢弃；地图撑满其余高度；底部「写入 N 张照片」。</li>
+      <li>气泡：悬停 tooltip「地名 · N 张」；点击弹出地点卡——勾选「纳入写入」、「聚焦」放大到该地。</li>
+      <li>放大越过阈值（spanLon ≤ 9°）气泡拆成缩略图；继续放大缩略图变大、可逐张点击。</li>
+      <li>点击缩略图：中间栏切换为单图查看（loupe），缩略图高亮；「返回网格」还原。写入勾选状态不受影响。</li>
+      <li>密集城市（广深、成渝）国家级视角少量重叠：按数量降序绘制，小泡在上；按屏幕距离聚合留作改进。</li>
+    </ul>
+
+    <h3>设计决策</h3>
+    <ul>
+      <li><b>地图是主视图</b>（2026-11-11 二稿，按反馈去掉地图下方的城市列表）：评审数据完全落在地图上，每地操作走气泡弹出卡。</li>
+      <li><b>可交互正视图</b>：滚轮锚点缩放 + 拖动平移 + 双击放大，替代固定预置档为主、chips 仅作快捷方式。</li>
+      <li><b>缩略图即照片定位</b>：照片 GPS 抖动散布在地点周围是示意——真实实现按每张照片自己的经纬度落点。</li>
+      <li><b>无瓦片</b>：离线、无网络请求；边界数据编译进扩展，需记录出处。</li>
+      <li><b>南海诸岛</b>：右下角 inset 固定显示，遵守标准地图画法。</li>
+    </ul>
+  </div>
+
+  <div class="doc">
+    <h2>文案审计表</h2>
+    <p style="margin:0 0 10px">新增文案走 <code>i18n::tr</code>，英文为源语言，简体中文写入 <code>zh-hans.json</code>。</p>
+    <table>
+      <thead><tr><th>英文源文案</th><th>简体中文</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td class="src">Map</td><td class="zh">地图</td><td>区段标题，可收起</td></tr>
+        <tr><td class="src">China · {n} places</td><td class="zh">中国 · {n} 个地点</td><td>区段右侧摘要</td></tr>
+        <tr><td class="src">All of China / East China / Pearl River Delta / Western Sichuan</td><td class="zh">全国 / 华东 / 珠三角 / 川西</td><td>缩放快捷 chips</td></tr>
+        <tr><td class="src">Zoom in / Zoom out / Reset view</td><td class="zh">放大 / 缩小 / 复位视图</td><td>右上角按钮 tooltip</td></tr>
+        <tr><td class="src">Include in write</td><td class="zh">纳入写入</td><td>地点卡勾选</td></tr>
+        <tr><td class="src">Focus</td><td class="zh">聚焦</td><td>地点卡按钮：放大到该地</td></tr>
+        <tr><td class="src">{place} · {n} photos</td><td class="zh">{place} · {n} 张</td><td>气泡 tooltip</td></tr>
+        <tr><td class="src">{file} · {km} km from {place}</td><td class="zh">{file} · 距 {place} {km} km</td><td>缩略图 tooltip</td></tr>
+        <tr><td class="src">+{n} more</td><td class="zh">+{n} 张</td><td>未画出的缩略图</td></tr>
+        <tr><td class="src">Back to grid</td><td class="zh">返回网格</td><td>中间栏 loupe 返回</td></tr>
+        <tr><td class="src">Bubble size = photo count · scroll to zoom, drag to pan · zoom in for photo thumbnails</td><td class="zh">气泡大小 ∝ 照片数 · 滚轮缩放 / 拖动平移 · 放大后出现照片缩略图</td><td>地图下方图例</td></tr>
+        <tr><td class="src">Outside China: {n} photos · no match: {m} · no GPS: {k} — not shown, not written</td><td class="zh">中国以外 {n} 张 · 未匹配 {m} 张 · 无 GPS {k} 张 — 不上图，不写入</td><td>汇总行</td></tr>
+        <tr><td class="src">South China Sea Islands</td><td class="zh">南海诸岛</td><td>inset 标注</td></tr>
+        <tr><td class="src">Boundaries are schematic in this mock</td><td class="zh">边界为示意</td><td>正式版换标准边界数据后移除</td></tr>
+      </tbody>
+    </table>
+
+    <h3>配色（取自原生 Charcoal 主题）</h3>
+    <div class="swatches" style="padding-bottom:16px">
+      <div class="sw" style="background:#2d2d2d"><span>chrome</span></div>
+      <div class="sw" style="background:#1c1c1c"><span>canvas</span></div>
+      <div class="sw" style="background:#232323"><span>inset</span></div>
+      <div class="sw" style="background:#141414"><span>sea</span></div>
+      <div class="sw" style="background:#242424"><span>land</span></div>
+      <div class="sw" style="background:#0165dd"><span>accent</span></div>
+      <div class="sw" style="background:#7fb3ff"><span>accent-text</span></div>
+      <div class="sw" style="background:#e2e2e2"><span>text</span></div>
+    </div>
+  </div>
+</div>
+
+
+<script>
+  // ---------------------------------------------------------------- data
+  // 示意数据：每个地点 = 评审里的一个分组（国家=中国，城市=地名库反查结果）。
+  const PLACES = [
+    {name:'北京', lon:116.40, lat:39.90, n:173},
+    {name:'上海', lon:121.47, lat:31.23, n:136},
+    {name:'杭州', lon:120.16, lat:30.27, n:78},
+    {name:'成都', lon:104.07, lat:30.67, n:107},
+    {name:'重庆', lon:106.55, lat:29.56, n:44},
+    {name:'广州', lon:113.26, lat:23.13, n:71},
+    {name:'深圳', lon:114.06, lat:22.55, n:58},
+    {name:'武汉', lon:114.30, lat:30.59, n:33},
+    {name:'西安', lon:108.94, lat:34.34, n:51},
+    {name:'昆明', lon:102.83, lat:24.88, n:37},
+    {name:'拉萨', lon:91.11, lat:29.65, n:31},
+    {name:'乌鲁木齐', lon:87.62, lat:43.83, n:21},
+    {name:'哈尔滨', lon:126.63, lat:45.75, n:40},
+    {name:'青岛', lon:120.38, lat:36.07, n:30},
+    {name:'厦门', lon:118.09, lat:24.48, n:23},
+    {name:'三亚', lon:109.50, lat:18.25, n:27},
+    {name:'兰州', lon:103.83, lat:36.06, n:15},
+    {name:'敦煌', lon:94.66, lat:40.14, n:14},
+    {name:'康定', lon:101.96, lat:30.05, n:18},
+    {name:'稻城', lon:100.30, lat:29.04, n:12},
+    {name:'桂林', lon:110.29, lat:25.27, n:20},
+    {name:'呼和浩特', lon:111.75, lat:40.84, n:10},
+  ];
+
+  // 手绘简化边界（原创示意矢量，仅用于设计稿；正式实现换标准边界数据）。
+  const MAINLAND = [
+    [122.4,53.5],[124.8,53.2],[126.6,52.3],[127.5,50.7],[129.8,49.8],[131.3,48.9],[133.2,48.1],[134.4,48.4],
+    [133.4,47.0],[132.2,45.6],[131.2,44.7],[131.1,43.3],[130.6,42.4],[129.0,41.6],[127.2,41.5],[125.7,40.9],
+    [124.3,40.1],[122.6,39.6],[121.3,38.8],[121.8,39.5],[122.0,40.6],[121.0,40.5],[119.5,39.9],[118.0,39.1],
+    [118.6,38.2],[119.9,37.5],[121.5,37.5],[122.7,37.4],[121.0,36.6],[119.9,35.9],[119.3,34.7],[120.9,32.8],
+    [121.9,31.4],[121.0,30.6],[121.6,29.9],[120.7,28.0],[119.9,26.8],[119.6,25.9],[118.6,24.9],[118.1,24.4],
+    [116.9,23.4],[114.7,22.6],[113.4,22.0],[112.2,21.6],[110.6,21.2],[110.3,20.2],[109.8,21.4],[109.0,21.5],
+    [108.0,21.6],[106.7,22.8],[105.3,23.3],[103.9,22.5],[102.1,22.4],[101.1,21.7],[100.9,21.2],[100.1,21.6],
+    [99.9,22.5],[99.2,23.0],[98.3,24.1],[97.6,24.8],[97.9,25.5],[98.7,26.1],[98.5,27.0],[97.6,28.2],
+    [95.5,28.6],[94.0,27.7],[92.2,27.0],[90.4,27.3],[89.1,27.4],[88.1,27.9],[86.6,28.1],[84.5,28.6],
+    [82.5,29.3],[81.0,30.1],[79.7,31.1],[78.6,32.6],[78.0,34.6],[76.8,35.6],[75.9,36.7],[74.9,37.2],
+    [74.6,38.0],[75.2,39.6],[74.8,40.7],[76.0,41.0],[78.0,41.4],[80.2,42.2],[80.6,43.2],[82.6,43.2],
+    [83.5,44.2],[85.0,44.8],[85.7,46.0],[86.5,46.6],[88.0,47.9],[90.6,47.7],[93.5,45.0],[95.5,44.3],
+    [96.8,43.0],[99.5,42.5],[101.9,42.5],[104.5,41.8],[107.3,42.4],[109.5,42.4],[111.0,43.3],[113.5,44.7],
+    [115.5,45.5],[117.4,46.5],[119.9,46.7],[119.3,48.0],[117.8,48.1],[116.7,49.8],[119.3,50.3],[120.7,51.6],
+    [122.0,53.0]
+  ];
+  const HAINAN = [[110.0,20.1],[110.6,19.6],[110.5,18.8],[109.7,18.2],[108.9,18.5],[108.6,19.4],[109.2,20.0]];
+  const TAIWAN = [[121.8,25.3],[121.9,24.5],[121.6,23.5],[120.9,21.9],[120.2,22.6],[120.1,23.8],[120.9,24.8]];
+
+  const FILES = ['DSC_4821.CR3','P1002467.RW2','IMG_9032.jpg','DJI_0213.DNG','DSCF5510.RAF','A7R5_1234.ARW','_DSC7788.NEF','IMG_20260511_1423.jpg'];
+  const THUMBS = ['a','b','c','d'];
+
+  // ---------------------------------------------------------------- state
+  const PRESETS = [
+    {label:'全国',   cLon:104.5, cLat:36.2, spanLon:62},
+    {label:'华东',   cLon:119.8, cLat:31.0, spanLon:15},
+    {label:'珠三角', cLon:113.7, cLat:22.6, spanLon:6},
+    {label:'川西',   cLon:101.2, cLat:29.6, spanLon:8},
+  ];
+  const THRESH = 9;          // spanLon ≤ 9° 时气泡拆成缩略图
+  const KX = 16 * 0.819;     // 世界坐标：x = lon·KX（cos35° 压缩）
+  const KY = 16;             //            y = -lat·KX
+
+  const st = {
+    view: {...PRESETS[0]},
+    mode: 'bubbles',         // bubbles | thumbs
+    selected: -1,            // 选中的地点（气泡高亮 + 地点卡）
+    selPhoto: null,          // {i,k} 中间栏正在展示的照片
+    groupOff: new Set(),     // 不写入的地点
+    photos: new Map(),       // i -> [{file,km,th}] 缓存
+    dragged: false,
+    mapOpen: true,
+  };
+
+  const mapBox = document.getElementById('map-box');
+  const svg = document.getElementById('map-svg');
+  const overlay = document.getElementById('overlay');
+  const tip = document.getElementById('map-tip');
+  const popup = document.getElementById('popup');
+
+  // ---------------------------------------------------------------- helpers
+  function rng(seed){
+    let a = seed >>> 0;
+    return function(){
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function photosFor(i){
+    let arr = st.photos.get(i);
+    if (!arr){
+      const r = rng(i * 7919 + 13);
+      arr = [];
+      for (let k = 0; k < PLACES[i].n; k++){
+        arr.push({file: FILES[k % FILES.length].replace(/(\d+)/, m => String(+m + Math.floor(r()*900))),
+                  km: (0.4 + r()*29).toFixed(1), th: THUMBS[k % 4],
+                  dx: (r()-0.5)*2, dy: (r()-0.5)*2});   // 示意：照片相对地点的散布（真实实现用照片自身 GPS）
+      }
+      st.photos.set(i, arr);
+    }
+    return arr;
+  }
+
+  // ---------------------------------------------------------------- base map（一次生成，世界坐标）
+  (function buildBase(){
+    const ring = pts => pts.map(([lo,la],ix)=>(ix?'L':'M')+ (lo*KX).toFixed(1)+' '+(-la*KY).toFixed(1)).join('')+'Z';
+    let g = '';
+    for (let lon = 70; lon <= 140; lon += 10)
+      g += `<line class="grat" x1="${(lon*KX).toFixed(1)}" y1="${-55*KY}" x2="${(lon*KX).toFixed(1)}" y2="${-15*KY}"/>`;
+    for (let lat = 15; lat <= 55; lat += 10)
+      g += `<line class="grat" x1="${70*KX}" y1="${(-lat*KY).toFixed(1)}" x2="${140*KX}" y2="${(-lat*KY).toFixed(1)}"/>`;
+    svg.innerHTML = g
+      + `<path class="coast" d="${ring(MAINLAND)}"/>`
+      + `<path class="island" d="${ring(HAINAN)}"/>`
+      + `<path class="island" d="${ring(TAIWAN)}"/>`;
+  })();
+
+  // ---------------------------------------------------------------- render
+  let raf = 0;
+  function schedule(){ if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); }); }
+
+  function render(){
+    const rect = mapBox.getBoundingClientRect();
+    if (rect.width < 60 || rect.height < 60) return;   // 面板隐藏时跳过
+    const v = st.view;
+    const pxW = rect.width, pxH = rect.height;
+    const spanLat = v.spanLon * (pxH/pxW) * (KX/KY);
+    const vbX = (v.cLon - v.spanLon/2) * KX;
+    const vbY = -(v.cLat + spanLat/2) * KY;
+    const wW = v.spanLon * KX, wH = spanLat * KY;
+    svg.setAttribute('viewBox', `${vbX.toFixed(2)} ${vbY.toFixed(2)} ${wW.toFixed(2)} ${wH.toFixed(2)}`);
+    st.px = {pxW, pxH, vbX, vbY, wW, wH, spanLat};
+    // 放大到区域级以下时隐藏南海诸岛 inset，避免遮挡当前视图
+    document.querySelector('.map-inset').style.display = v.spanLon > 20 ? '' : 'none';
+    renderOverlay();
+    renderChips();
+    hideTip();
+    hidePopup();
+  }
+
+  function toPx(lon, lat){
+    const p = st.px;
+    return [ (lon*KX - p.vbX)/p.wW * p.pxW, (-lat*KY - p.vbY)/p.wH * p.pxH ];
+  }
+
+  function renderOverlay(){
+    const v = st.view;
+    const mode = v.spanLon <= THRESH ? 'thumbs' : 'bubbles';
+    st.mode = mode;
+    const parts = [];
+
+    if (mode === 'bubbles'){
+      const showLabels = v.spanLon <= 18;
+      const order = PLACES.map((p,i)=>i).sort((a,b)=>PLACES[b].n-PLACES[a].n);   // 大泡先画，小泡在上
+      for (const i of order){
+        const p = PLACES[i];
+        const [x,y] = toPx(p.lon, p.lat);
+        const m = 50;
+        if (x < -m || x > st.px.pxW+m || y < -m || y > st.px.pxH+m) continue;
+        const r = Math.round(Math.max(8, Math.min(30, 2.35*Math.sqrt(p.n))));
+        const off = st.groupOff.has(i);
+        const cls = 'bub' + (r>=12?' haloed':'') + (st.selected===i?' sel':'') + (off?' off':'');
+        const label = r>=24 ? `<span>${p.n}</span>` : '';
+        parts.push(`<div class="${cls}" data-bub="${i}" data-tip="<b>${p.name}</b> · ${p.n} 张${off?' · 已排除':''}" style="left:${x.toFixed(1)}px;top:${y.toFixed(1)}px;width:${r*2}px;height:${r*2}px">${label}</div>`);
+        if (showLabels && !off){
+          parts.push(`<div class="tlabel" style="left:${x.toFixed(1)}px;top:${(y+r+4).toFixed(1)}px">${p.name}</div>`);
+        }
+      }
+    } else {
+      // 缩略图模式：每地照片散布在拍摄点周围
+      const budget = 130;
+      let used = 0;
+      const size = Math.round(Math.min(54, Math.max(26, 24 + 46/Math.sqrt(v.spanLon))));
+      const order = PLACES.map((p,i)=>i).sort((a,b)=>PLACES[b].n-PLACES[a].n);
+      for (const i of order){
+        if (used >= budget) break;
+        const p = PLACES[i];
+        const [cx,cy] = toPx(p.lon, p.lat);
+        const m = 90;
+        if (cx < -m || cx > st.px.pxW+m || cy < -m || cy > st.px.pxH+m) continue;
+        const phs = photosFor(i);
+        const cap = Math.min(p.n, Math.max(8, Math.round(26/Math.sqrt(v.spanLon))), budget-used);
+        const spread = size * 3.4;
+        for (let k = 0; k < cap; k++){
+          const ph = phs[k];
+          const x = cx + ph.dx * spread, y = cy + ph.dy * spread;
+          const sel = st.selPhoto && st.selPhoto.i===i && st.selPhoto.k===k;
+          parts.push(`<div class="mthumb${sel?' sel':''}" data-thumb="${i}:${k}" data-tip="<b>${ph.file}</b> · 距 ${p.name} 市中心 ${ph.km} km" style="left:${x.toFixed(1)}px;top:${y.toFixed(1)}px;width:${size}px;height:${Math.round(size*0.72)}px"><div class="ph ${ph.th}"></div></div>`);
+        }
+        if (p.n > cap) parts.push(`<div class="tlabel" style="left:${(cx+spread+size*0.8).toFixed(1)}px;top:${cy.toFixed(1)}px">+${p.n-cap} 张</div>`);
+        parts.push(`<div class="tlabel" style="left:${cx.toFixed(1)}px;top:${(cy+spread+8).toFixed(1)}px">${p.name} · ${p.n} 张</div>`);
+      }
+    }
+    overlay.innerHTML = parts.join('');
+  }
+
+  function renderChips(){
+    document.getElementById('map-chips').innerHTML = PRESETS.map((p,i)=>{
+      const on = st.view.label === p.label && Math.abs(st.view.spanLon - p.spanLon) < .01;
+      return `<button class="chip-btn${on?' on':''}" onclick="setView(${i})">${p.label}</button>`;
+    }).join('');
+  }
+  function setView(i){
+    st.view = {...PRESETS[i]};
+    render();
+  }
+  function focusCity(i){
+    const p = PLACES[i];
+    st.view = {label:'聚焦 · '+p.name, cLon:p.lon, cLat:p.lat, spanLon:3.2};
+    st.selected = i;
+    render();
+  }
+  function zoomBy(f, ax, ay){
+    const v = st.view;
+    const p = st.px;
+    const pxW = p ? p.pxW : mapBox.getBoundingClientRect().width;
+    const pxH = p ? p.pxH : mapBox.getBoundingClientRect().height;
+    const mx = ax === undefined ? pxW/2 : ax;
+    const my = ay === undefined ? pxH/2 : ay;
+    const spanLat = v.spanLon * (pxH/pxW) * (KX/KY);
+    const lonA = v.cLon + (mx - pxW/2) * v.spanLon/pxW;
+    const latA = v.cLat - (my - pxH/2) * spanLat/pxH;
+    const span2 = Math.min(70, Math.max(1.2, v.spanLon / f));
+    const spanLat2 = span2 * (pxH/pxW) * (KX/KY);
+    st.view = {
+      label: st.view.label.startsWith('聚焦') || Math.abs(v.spanLon - span2) < .01 ? st.view.label : '自定义',
+      cLon: lonA - (mx - pxW/2) * span2/pxW,
+      cLat: latA + (my - pxH/2) * spanLat2/pxH,
+      spanLon: span2,
+    };
+    clampView();
+    render();
+  }
+  function clampView(){
+    const v = st.view;
+    v.spanLon = Math.min(70, Math.max(1.2, v.spanLon));
+    v.cLon = Math.min(134, Math.max(75, v.cLon));
+    v.cLat = Math.min(53, Math.max(16, v.cLat));
+  }
+
+  // ---------------------------------------------------------------- 交互：滚轮 / 拖动 / 双击
+  mapBox.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = mapBox.getBoundingClientRect();
+    zoomBy(e.deltaY < 0 ? 1.3 : 1/1.3, e.clientX-rect.left, e.clientY-rect.top);
+  }, {passive:false});
+
+  mapBox.addEventListener('dblclick', e => {
+    const rect = mapBox.getBoundingClientRect();
+    zoomBy(1.6, e.clientX-rect.left, e.clientY-rect.top);
+  });
+
+  let drag = null;
+  mapBox.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    drag = {x:e.clientX, y:e.clientY, moved:false};
+    hidePopup();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx,dy) < 4) return;
+    drag.moved = true;
+    mapBox.classList.add('dragging');
+    const p = st.px;
+    st.view.cLon -= dx * st.view.spanLon / p.pxW;
+    st.view.cLat += dy * st.view.spanLat / p.pxH;
+    clampView();
+    drag.x = e.clientX; drag.y = e.clientY;
+    schedule();
+  });
+  window.addEventListener('mouseup', () => {
+    if (drag && drag.moved) st.dragged = true;
+    mapBox.classList.remove('dragging');
+    setTimeout(() => st.dragged = false, 0);
+    drag = null;
+  });
+  window.addEventListener('resize', schedule);
+
+  // ---------------------------------------------------------------- 交互：气泡 / 缩略图 / tooltip
+  function showTip(html, x, y){
+    tip.innerHTML = html;
+    const rect = mapBox.getBoundingClientRect();
+    let tx = x + 12, ty = y + 12;
+    if (tx + 170 > rect.width) tx = rect.width - 170;
+    if (ty + 34 > rect.height) ty = rect.height - 34;
+    tip.style.left = tx+'px'; tip.style.top = ty+'px';
+    tip.style.display = 'block';
+  }
+  function hideTip(){ tip.style.display = 'none'; }
+
+  overlay.addEventListener('mousemove', e => {
+    const t = e.target.closest('[data-tip]');
+    const rect = mapBox.getBoundingClientRect();
+    if (t && !st.dragged) showTip(t.dataset.tip, e.clientX-rect.left, e.clientY-rect.top);
+    else hideTip();
+  });
+  overlay.addEventListener('mouseleave', hideTip);
+
+  overlay.addEventListener('click', e => {
+    if (st.dragged) return;
+    const bub = e.target.closest('[data-bub]');
+    if (bub){ showPopup(+bub.dataset.bub, bub); return; }
+    const th = e.target.closest('[data-thumb]');
+    if (th){
+      const [i,k] = th.dataset.thumb.split(':').map(Number);
+      selectPhoto(i, k);
+    }
+  });
+
+  // ---------------------------------------------------------------- 地点卡（代替列表）
+  function showPopup(i, bub){
+    const p = PLACES[i];
+    const off = st.groupOff.has(i);
+    const rect = mapBox.getBoundingClientRect();
+    const b = bub.getBoundingClientRect();
+    let x = b.right - rect.left + 8, y = b.top - rect.top - 8;
+    if (x + 186 > rect.width) x = b.left - rect.left - 186;
+    if (x < 8) x = 8;
+    if (y + 120 > rect.height) y = rect.height - 120;
+    if (y < 8) y = 8;
+    popup.innerHTML = `
+      <div class="pp-head">中国 › ${p.name}<span class="pp-close" onclick="hidePopup()">×</span></div>
+      <div class="pp-path">地点|中国|${p.name} · ${p.n} 张</div>
+      <label class="check"><input type="checkbox" ${off?'':'checked'} onchange="toggleGroup(${i},this.checked)"><span class="box"></span>纳入写入</label>
+      <div class="pp-acts"><button class="chip-btn" onclick="hidePopup();focusCity(${i})">聚焦</button></div>`;
+    popup.style.left = x+'px'; popup.style.top = y+'px';
+    popup.hidden = false;
+    st.selected = i;
+    // 更新气泡高亮
+    overlay.querySelectorAll('.bub').forEach(el => el.classList.toggle('sel', +el.dataset.bub === i));
+  }
+  function hidePopup(){ popup.hidden = true; }
+
+  function toggleGroup(i, on){
+    if (on) st.groupOff.delete(i); else st.groupOff.add(i);
+    recount();
+    renderOverlay();
+  }
+  function acceptAll(){
+    st.groupOff.clear();
+    recount();
+    renderOverlay();
+  }
+  function toggleMap(){
+    st.mapOpen = !st.mapOpen;
+    document.getElementById('map-card').classList.toggle('closed', !st.mapOpen);
+    schedule();
+  }
+
+  // ---------------------------------------------------------------- 中间栏 loupe
+  function selectPhoto(i, k){
+    st.selPhoto = {i, k};
+    const p = PLACES[i], ph = photosFor(i)[k];
+    document.getElementById('loupe-img').className = 'ph loupe-img ' + ph.th;
+    document.getElementById('loupe-meta').innerHTML =
+      `<b>${ph.file}</b><div class="sub">中国 › ${p.name} · 距市中心 ${ph.km} km · 将写入 <b>地点|中国|${p.name}</b></div>`;
+    document.getElementById('loupe').hidden = false;
+    document.getElementById('cgrid').style.display = 'none';
+    renderOverlay();
+  }
+  function closeLoupe(){
+    st.selPhoto = null;
+    document.getElementById('loupe').hidden = true;
+    document.getElementById('cgrid').style.display = '';
+    renderOverlay();
+  }
+
+  // ---------------------------------------------------------------- 计数
+  function recount(){
+    let photos = 0, groups = 0;
+    for (let i = 0; i < PLACES.length; i++){
+      if (st.groupOff.has(i)) continue;
+      photos += PLACES[i].n; groups++;
+    }
+    document.getElementById('sum-photos').textContent = photos;
+    document.getElementById('sum-groups').textContent = groups;
+    document.getElementById('btn-count').textContent = photos;
+    document.getElementById('map-count').textContent = PLACES.length;
+  }
+
+  // ---------------------------------------------------------------- prototype states
+  function setState(name){
+    document.querySelectorAll('.state').forEach(el => el.classList.toggle('on', el.dataset.panel === name));
+    document.querySelectorAll('[data-state]').forEach(b => b.classList.toggle('on', b.dataset.state === name));
+    document.querySelector('.page').scrollTop = 0;
+    if (name === 'review') schedule();
+  }
+  document.querySelectorAll('[data-state]').forEach(b => b.addEventListener('click', () => setState(b.dataset.state)));
+  document.querySelectorAll('[data-width]').forEach(b => b.addEventListener('click', () => {
+    document.getElementById('dock').style.setProperty('--dock-w', b.dataset.width + 'px');
+    document.querySelectorAll('[data-width]').forEach(x => x.classList.toggle('on', x === b));
+    schedule();
+  }));
+  function flash(el){
+    const old = el.textContent;
+    el.textContent = '原型未接入';
+    setTimeout(() => { el.textContent = old; }, 900);
+  }
+  const q = new URLSearchParams(location.search);
+  if (q.get('state')) setState(q.get('state'));
+  if (q.get('width')) {
+    document.getElementById('dock').style.setProperty('--dock-w', q.get('width') + 'px');
+    document.querySelectorAll('[data-width]').forEach(x => x.classList.toggle('on', x.dataset.width === q.get('width')));
+  }
+
+  recount();
+  render();
+</script>
+</div>
+
+</body>
+</html>

@@ -30,6 +30,8 @@ impl LightcraftApp {
             session,
             ui: UiState::default(),
             services,
+            extension_pages: vec![],
+            extension_page: None,
             renderer: render::Renderer::default(),
             perf: Perf::default(),
             caches: Caches::default(),

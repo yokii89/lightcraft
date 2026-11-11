@@ -600,6 +600,10 @@ fn ui_commands_4(app: &mut LightcraftApp, _ctx: &egui::Context, id: &str, p: &Va
             app.ui.left_panel = !app.ui.left_panel;
             Ok(Value::Null)
         }
+        "view.extensionPage" => {
+            app.ui.extension_open = !app.ui.extension_open;
+            Ok(Value::Null)
+        }
         "view.rightPanel" => {
             // Classic's F8: hide the right panel, and bring back the same one next time (Edit when
             // none was hidden). Hiding a tool ends it, as closing its panel does.

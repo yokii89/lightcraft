@@ -82,6 +82,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("view.autoAdvance", "Auto Advance", None, "Photo"),
     ("view.filmstrip", "Filmstrip", Some("/"), "View"),
     ("view.leftPanel", "My Photos Panel", Some("Cmd+Shift+L"), "View"),
+    ("view.extensionPage", "Extensions Panel", None, "View"),
     ("view.rightPanel", "Right Panel", None, "View"),
     ("view.beforeAfter", "Before/After Side by Side", Some("Y"), "View"),
     ("view.beforeAfterSplit", "Before/After Split", Some("Shift+Y"), "View"),

@@ -56,6 +56,8 @@ pub struct UiState {
     pub right_width: f32,
     /// Presets column open (opens to the left of the Edit panel).
     pub presets: bool,
+    /// The Extensions panel (`view.extensionPage`): the pages the desktop host registered.
+    pub extension_open: bool,
     /// Presets column: show a live thumbnail of the photo with each preset.
     pub preset_thumbs: bool,
     pub filmstrip: bool,
@@ -406,6 +408,7 @@ impl Default for UiState {
             right: RightPanel::Edit,
             right_hidden: RightPanel::None,
             presets: false,
+            extension_open: false,
             preset_thumbs: false,
             filmstrip: true,
             zoom: Zoom::Fit,

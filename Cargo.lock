@@ -3622,6 +3622,7 @@ dependencies = [
  "egui",
  "lightcraft-codecs",
  "lightcraft-engine",
+ "lightcraft-extension",
  "lightcraft-raster",
  "lightcraft-sysmem",
  "lightcraft-testkit",
@@ -3810,6 +3811,24 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "web-time",
+]
+
+[[package]]
+name = "lightcraft-extension"
+version = "0.18.0"
+dependencies = [
+ "egui",
+ "lightcraft-catalog",
+ "lightcraft-codecs",
+ "lightcraft-engine",
+ "lightcraft-geocode",
+ "lightcraft-raster",
+ "lightcraft-scenes",
+ "lightcraft-testkit",
+ "lightcraft-ui-egui",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

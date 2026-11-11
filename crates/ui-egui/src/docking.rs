@@ -16,16 +16,20 @@ pub enum Panel {
     Library,
     Tools,
     Presets,
+    /// The pages the host registered through [`crate::LightcraftApp::register_extension_page`]
+    /// ([`crate::ext`]); empty until a host adds one.
+    Extension,
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::Library, Self::Tools, Self::Presets];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::Library, Self::Tools, Self::Presets, Self::Extension];
     pub fn id(self) -> &'static str {
         match self {
             Self::Canvas => "canvas",
             Self::Library => "library",
             Self::Tools => "tools",
             Self::Presets => "presets",
+            Self::Extension => "extension",
         }
     }
     fn label(self) -> &'static str {
@@ -34,6 +38,7 @@ impl Panel {
             Self::Library => "Library",
             Self::Tools => "Tools",
             Self::Presets => "Presets",
+            Self::Extension => "Extensions",
         }
     }
     /// The dock the panel opens in when it has no recorded place.
@@ -47,6 +52,7 @@ impl Panel {
             Self::Library => crate::state::LEFT_WIDTH.default,
             Self::Tools => crate::state::RIGHT_WIDTH.default,
             Self::Presets => PRESETS_WIDTH,
+            Self::Extension => 320.0,
         }
     }
 }
@@ -236,12 +242,14 @@ fn from_ui(app: &crate::LightcraftApp) -> Workspace {
 fn sync(workspace: &mut Workspace, app: &crate::LightcraftApp) -> Result<(), String> {
     set_visible(workspace, Panel::Library, app.ui.left_panel)?;
     set_visible(workspace, Panel::Tools, app.ui.right != crate::state::RightPanel::None)?;
-    set_visible(workspace, Panel::Presets, app.ui.presets)
+    set_visible(workspace, Panel::Presets, app.ui.presets)?;
+    set_visible(workspace, Panel::Extension, app.ui.extension_open)
 }
 
 fn publish_visibility(app: &mut crate::LightcraftApp, workspace: &Workspace) {
     app.ui.left_panel = workspace.layout.contains(&Panel::Library);
     app.ui.presets = workspace.layout.contains(&Panel::Presets);
+    app.ui.extension_open = workspace.layout.contains(&Panel::Extension);
     if !workspace.layout.contains(&Panel::Tools) {
         app.ui.right = crate::state::RightPanel::None;
     } else if app.ui.right == crate::state::RightPanel::None {
@@ -275,6 +283,8 @@ pub(crate) fn exposed(app: &crate::LightcraftApp, panel: Panel) -> bool {
 pub(crate) fn reveal_command(app: &mut crate::LightcraftApp, id: &str) -> Result<(), String> {
     let panel = if id == "panel.presets" && app.ui.presets {
         Some(Panel::Presets)
+    } else if id == "view.extensionPage" && app.ui.extension_open {
+        Some(Panel::Extension)
     } else if id == "app.showInFolders" {
         // the sidebar it scrolls, also when it is a tab behind another panel
         Some(Panel::Library)
@@ -420,6 +430,11 @@ pub fn show(app: &mut crate::LightcraftApp, ui: &mut egui::Ui) {
                 crate::widgets::announce_region(ui, egui::accesskit::Role::Complementary, crate::i18n::tr(Panel::Presets.label()));
                 crate::panels::presets::show(app, ui);
             }
+            Panel::Extension => {
+                crate::widgets::announce_region(ui, egui::accesskit::Role::Complementary, crate::i18n::tr(Panel::Extension.label()));
+                crate::widgets::register(ui, "panel:extension", ui.max_rect());
+                crate::ext::show(app, ui);
+            }
         },
     );
     if let Some(mut canvas) = canvas {
@@ -542,6 +557,7 @@ fn panel_limits(panel: &Panel) -> PanelLimits {
         Panel::Library => (egui::vec2(crate::state::LEFT_WIDTH.min, 120.0), crate::state::LEFT_WIDTH.max),
         Panel::Tools => (egui::vec2(crate::state::RIGHT_WIDTH.min, 120.0), crate::state::RIGHT_WIDTH.max),
         Panel::Presets => (egui::vec2(250.0, 120.0), 520.0),
+        Panel::Extension => (egui::vec2(200.0, 120.0), 720.0),
     };
     PanelLimits { min, max: egui::vec2(max_width, 1_000_000.0) }
 }
@@ -583,6 +599,18 @@ mod tests {
         );
         let root = if first { split(axis, size, tabs(Panel::Tools), rest) } else { split(axis, size, rest, tabs(Panel::Tools)) };
         Workspace::new(Layout { root: Some(root), floating: Vec::new() })
+    }
+
+    #[test]
+    fn extension_panel_visibility_round_trips_with_its_state() {
+        let mut app = app_with_widths();
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        assert!(exposed_in(&workspace, Panel::Extension), "the open Extensions panel joins the layout");
+        set_visible(&mut workspace, Panel::Extension, false).unwrap();
+        publish_visibility(&mut app, &workspace);
+        assert!(!app.ui.extension_open, "closing the panel turns its state off");
     }
 
     #[test]

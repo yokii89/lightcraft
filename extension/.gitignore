@@ -1,0 +1,8 @@
+# Downloaded model weights live here at development time (see server/download_model.py);
+# they are gigabytes of third-party data and never enter the repository. The root
+# .gitignore already excludes *.safetensors — this covers the whole tree, including
+# the tokenizer and config files that sit next to them.
+server/models/
+
+# Cargo build output and local profiling scripts/logs (not part of the extension).
+target/

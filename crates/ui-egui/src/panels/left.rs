@@ -37,7 +37,7 @@ pub(crate) use sections::PlacedSection;
 pub use sections::section_drag_feedback;
 #[cfg(test)]
 pub(crate) use sections::section_drop_before;
-use sections::{SECTION_GAP, missing_count, pinned_header, section, section_drag, sections_menu};
+use sections::{SECTION_GAP, missing_count, pinned_header, section, section_drag, sections_menu, visible_right};
 
 /// Draw the My Photos sidebar: title and open-library name, the scrollable sources, albums,
 /// folders and sections, with the section visibility menu on the title.
@@ -176,6 +176,11 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 placed.push(at);
             }
             ui.data_mut(|d| d.remove::<String>(egui::Id::unique(SCROLL_TO_ROW)));
+            // Extension pages the host registered (`crate::ext`): clicking one opens the
+            // Extensions panel on that page. Nothing is drawn without a registered page.
+            if !app.extension_pages.is_empty() {
+                extension_rows(app, ui);
+            }
             // room below the last section (a section dragged to the end is dropped here)
             ui.add_space(SECTION_GAP * 2.0);
             pinned_header(app, ui, &placed, view_top);
@@ -195,4 +200,32 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             }
         });
     });
+}
+
+/// The Extensions block under the sections: one row per page the host registered. Clicking a row
+/// opens the Extensions panel on that page (also when it is open behind another panel).
+fn extension_rows(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    ui.add_space(SECTION_GAP);
+    let t = Tokens::get(ui.ctx());
+    let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+    let edge = visible_right(ui).min(header.right());
+    ui.painter().hline(header.left() + 18.0..=(edge - 18.0).max(header.left() + 18.0), header.top(), egui::Stroke::new(1.0, t.divider));
+    ui.painter().text(
+        pos2(header.left() + 18.0, header.center().y),
+        Align2::LEFT_CENTER,
+        crate::i18n::tr("Extensions"),
+        t.semibold(13.5),
+        t.text_label,
+    );
+    register(ui, "sidebarSection:extensions", header);
+    let pages: Vec<(&'static str, &'static str)> = app.extension_pages.iter().map(|page| (page.id, page.title)).collect();
+    let active = app.extension_page.or_else(|| app.extension_pages.first().map(|page| page.id));
+    for (id, title) in pages {
+        let selected = app.ui.extension_open && active == Some(id);
+        if Row::new(&format!("extension:{id}"), Icon::Extension, crate::i18n::tr(title)).selected(selected).show(app, ui).clicked() {
+            app.extension_page = Some(id);
+            app.ui.extension_open = true;
+            let _ = crate::docking::reveal_command(app, "view.extensionPage");
+        }
+    }
 }

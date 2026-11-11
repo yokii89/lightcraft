@@ -5238,3 +5238,32 @@ fn export_sizes_keep_the_pixels_typed() {
     type_value(&mut h, "sliderValue:export.sizeH", "1350");
     assert_eq!((resize(&h).value, resize(&h).height), (1080.0, 1350));
 }
+
+/// The sidebar lists the pages the host registered; clicking one docks the Extensions panel on it.
+#[test]
+fn the_sidebar_opens_the_extension_panel_on_its_page() {
+    use crate::ext::ExtensionPage;
+    fn page(_: &mut LightcraftApp, ui: &mut egui::Ui) {
+        crate::widgets::register(ui, "ext:test-page", ui.max_rect());
+    }
+    let mut h = demo([1400.0, 900.0]);
+    h.app.register_extension_page(ExtensionPage { id: "test", title: "Test", render: page });
+    h.app.ui.left_panel = true;
+    // every section folded: the Extensions block below them is on screen and can be clicked
+    h.request("ui.set", json!({"collapsedSidebar": ["albums", "local", "byDate", "folders", "keywords"]}), Duration::from_secs(10));
+    h.settle(SETTLE);
+    h.step();
+    h.step();
+    let w = h.request("ui.widgets", json!({}), Duration::from_secs(10)).to_string();
+    assert!(w.contains("\"sidebarSection:extensions\""), "the sidebar has no Extensions block: {w}");
+    assert!(w.contains("\"source:extension:test\""), "the registered page has no sidebar row: {w}");
+    let r = h.request("ui.clickWidget", json!({"id": "source:extension:test"}), Duration::from_secs(10));
+    assert_eq!(r["ok"], true, "{r}");
+    h.settle(SETTLE);
+    h.step();
+    h.step();
+    assert!(h.app.ui.extension_open && h.app.extension_page == Some("test"), "the row did not open the page");
+    let w = h.request("ui.widgets", json!({}), Duration::from_secs(10)).to_string();
+    assert!(w.contains("\"panel:extension\""), "the Extensions panel is not in the dock: {w}");
+    assert!(w.contains("\"ext:test-page\""), "the registered page did not render: {w}");
+}

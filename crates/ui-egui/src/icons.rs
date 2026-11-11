@@ -22,6 +22,8 @@ pub enum Icon {
     /// Eye with a slash (hidden).
     EyeOff,
     Presets,
+    /// Extensions: a plug (a page that plugs into the app).
+    Extension,
     Versions,
     Activity,
     More,
@@ -324,6 +326,11 @@ fn paint_with(p: &Painter, rect: Rect, icon: Icon, color: Color32, turn: Option<
         Presets => {
             pen.circle(8.0, 8.0, 5.0);
             pen.circle(12.0, 12.0, 5.0);
+        }
+        Extension => {
+            pen.rect(4.0, 8.0, 16.0, 17.0, 2.0);
+            pen.line(&[(8.0, 8.0), (8.0, 3.5)]);
+            pen.line(&[(12.0, 8.0), (12.0, 3.5)]);
         }
         Versions => {
             pen.rect(5.0, 3.0, 17.0, 13.0, 1.5);

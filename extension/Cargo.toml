@@ -1,0 +1,27 @@
+[package]
+name = "lightcraft-extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightCraft extensions: pages the desktop host registers into the native Extensions panel"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lightcraft-ui-egui = { workspace = true }
+lightcraft-engine = { workspace = true }
+lightcraft-catalog = { workspace = true }
+lightcraft-codecs = { workspace = true }
+lightcraft-geocode = { workspace = true }
+egui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+lightcraft-testkit = { workspace = true }
+lightcraft-scenes = { workspace = true }
+lightcraft-raster = { workspace = true }
