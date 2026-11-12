@@ -7,6 +7,9 @@ plan/
 /log
 .DS_Store
 .claude/
+.zcode/
+extension/docs/
+extension\PicMap-main
 /craft-fonts
 # nix build / nix develop
 /result
@@ -17,3 +20,5 @@ plan/
 
 # Python tools import their public operator family.
 __pycache__/
+
+extension/参考

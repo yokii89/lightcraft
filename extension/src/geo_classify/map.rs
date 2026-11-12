@@ -1,11 +1,14 @@
-//! The review map (design: `extension/docs/02-地理分类地图视图设计.md`): a schematic China drawn
-//! with the egui painter. The review's Chinese groups become bubbles at the centroid of their
+//! The review map (design: `extension/docs/02-地理分类地图视图设计.md`): AMap's online raster
+//! basemap under the review's Chinese groups. The groups become bubbles at the centroid of their
 //! photos' GPS; the wheel zooms around the pointer, dragging pans, and past a zoom threshold the
 //! bubbles split into the photos' thumbnails at their own positions — a thumbnail click opens the
 //! photo in the library's detail view, exactly like double-clicking a grid cell. One bubble's
 //! popup card (include in write / focus) replaces the review list's per-group rows.
 //!
-//! The boundaries are original simplified vectors (our own work, recorded in
+//! The projection is Web Mercator on AMap's GCJ-02 datum (see [`crate::tiles`]). When the online
+//! basemap is switched off, or while its tiles are missing or unreachable, the original schematic
+//! China outline is painted underneath: thematically neutral and always available offline. Those
+//! boundaries are original simplified vectors (our own work, recorded in
 //! `assets/ATTRIBUTION.md`); the on-map note stays until standard boundary data replaces them.
 
 use std::sync::{Arc, LazyLock};
@@ -20,6 +23,7 @@ use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::{i18n, icons, widgets};
 
 use super::{Group, State};
+use crate::tiles;
 use crate::ui::trn;
 
 // ---------------------------------------------------------------- the boundaries
@@ -220,19 +224,16 @@ static TAIWAN_TRIS: LazyLock<Vec<[usize; 3]>> = LazyLock::new(|| triangulate(TAI
 
 /// The national view.
 pub(crate) const NATIONAL: MapView = MapView { c_lon: 104.5, c_lat: 36.2, span_lon: 62.0 };
-/// World units per degree of latitude (the map's fixed scale).
-const K_Y: f64 = 16.0;
-/// World units per degree of longitude (compressed by cos 35°, like the prototype).
-const K_X: f64 = K_Y * 0.819;
-/// Zoom bounds, in degrees of longitude across the view.
-const MIN_SPAN: f64 = 1.2;
+/// Zoom bounds, in degrees of longitude across the view. The deep end reaches AMap's street
+/// level (z16) so the online basemap is useful down to a neighbourhood.
+const MIN_SPAN: f64 = 0.02;
 const MAX_SPAN: f64 = 70.0;
 /// Below this span (degrees of longitude across the view) bubbles split into photo thumbnails.
 pub(crate) const THRESH: f64 = 9.0;
 /// Zoom factor per wheel line-notch.
 const WHEEL_NOTCH: f64 = 1.35;
 /// Vertical room the map leaves for the legend line and the write button below it.
-const BELOW_RESERVE: f32 = 84.0;
+const BELOW_RESERVE: f32 = 34.0;
 const MIN_MAP_H: f32 = 260.0;
 /// Thumbnails requested per frame at most (the cache fills over the following frames).
 const THUMB_BUDGET: usize = 80;
@@ -253,27 +254,19 @@ impl Default for MapView {
     }
 }
 
-impl MapView {
-    /// Degrees of latitude the view spans for a widget of this size (the aspect correction).
-    fn span_lat(&self, size: Vec2) -> f64 {
-        let w = (size.x as f64).max(1.0);
-        let h = (size.y as f64).max(1.0);
-        self.span_lon * (h / w) * (K_X / K_Y)
-    }
-}
-
 /// Zoom by `factor` keeping the position under `at` (lat, lon) where it is.
-pub(crate) fn zoom_around(view: MapView, factor: f64, at: (f64, f64), span_lat: f64) -> MapView {
+pub(crate) fn zoom_around(view: MapView, factor: f64, at: (f64, f64), rect: Rect) -> MapView {
     let factor = factor.clamp(0.2, 5.0);
-    let span_lat = span_lat.max(1e-6);
-    let span2 = (view.span_lon / factor).clamp(MIN_SPAN, MAX_SPAN);
-    let span_lat2 = span_lat * span2 / view.span_lon;
-    let (at_lat, at_lon) = at;
-    MapView {
-        c_lon: at_lon - (at_lon - view.c_lon) * span2 / view.span_lon,
-        c_lat: at_lat + (view.c_lat - at_lat) * span_lat2 / span_lat,
-        span_lon: span2,
-    }
+    let span = (view.span_lon / factor).clamp(MIN_SPAN, MAX_SPAN);
+    let cam = Cam::new(&view, rect);
+    let (awx, awy) = tiles::world_xy_gcj(at.0, at.1);
+    let anchor = cam.world_to_px((awx, awy));
+    let px_per_world = (rect.width() as f64).max(1.0) * 360.0 / span;
+    let center = rect.center();
+    let cwx = awx - (anchor.x - center.x) as f64 / px_per_world;
+    let cwy = awy - (anchor.y - center.y) as f64 / px_per_world;
+    let (c_lat, c_lon) = tiles::lat_lon_gcj(cwx, cwy);
+    MapView { c_lon, c_lat, span_lon: span }
 }
 
 /// Keep the view inside China's neighbourhood.
@@ -283,32 +276,58 @@ pub(crate) fn clamp_view(view: &mut MapView) {
     view.c_lat = view.c_lat.clamp(16.0, 53.0);
 }
 
-/// The lat/lon → pixels transform for one frame.
+/// The lat/lon → pixels transform for one frame: Web Mercator, on AMap's GCJ-02 datum so the
+/// photo markers line up with the basemap.
 pub(crate) struct Cam {
     rect: Rect,
-    /// Degrees of latitude the view spans at this size (tests read it for the zoom invariant).
-    pub(crate) span_lat: f64,
+    /// The view centre on the world square, GCJ-02.
+    center: (f64, f64),
+    px_per_world: f64,
+    span_lon: f64,
 }
 
 impl Cam {
     pub(crate) fn new(view: &MapView, rect: Rect) -> Self {
-        Cam { rect, span_lat: view.span_lat(rect.size()) }
+        let center = tiles::world_xy_gcj(view.c_lat, view.c_lon);
+        let width = (rect.width() as f64).max(1.0);
+        Cam { rect, center, px_per_world: width * 360.0 / view.span_lon.max(1e-9), span_lon: view.span_lon }
     }
 
-    pub(crate) fn to_px(&self, view: &MapView, lat: f64, lon: f64) -> Pos2 {
-        let w = self.rect.width();
-        let h = self.rect.height();
-        let fx = (lon - (view.c_lon - view.span_lon * 0.5)) / view.span_lon;
-        let fy = ((view.c_lat + self.span_lat * 0.5) - lat) / self.span_lat;
-        pos2(self.rect.left() + (fx * w as f64) as f32, self.rect.top() + (fy * h as f64) as f32)
+    /// A point on the world square (both axes `0..=1`) to screen pixels.
+    fn world_to_px(&self, world: (f64, f64)) -> Pos2 {
+        let center = self.rect.center();
+        pos2(
+            (center.x as f64 + (world.0 - self.center.0) * self.px_per_world) as f32,
+            (center.y as f64 + (world.1 - self.center.1) * self.px_per_world) as f32,
+        )
     }
 
-    pub(crate) fn to_lat_lon(&self, view: &MapView, p: Pos2) -> (f64, f64) {
-        let w = (self.rect.width() as f64).max(1.0);
-        let h = (self.rect.height() as f64).max(1.0);
-        let lon = view.c_lon - view.span_lon * 0.5 + ((p.x - self.rect.left()) as f64 / w) * view.span_lon;
-        let lat = view.c_lat + self.span_lat * 0.5 - ((p.y - self.rect.top()) as f64 / h) * self.span_lat;
-        (lat, lon)
+    /// A screen pixel to the world square (GCJ-02), the inverse of [`Self::world_to_px`].
+    fn px_to_world(&self, p: Pos2) -> (f64, f64) {
+        let center = self.rect.center();
+        (self.center.0 + (p.x - center.x) as f64 / self.px_per_world, self.center.1 + (p.y - center.y) as f64 / self.px_per_world)
+    }
+
+    pub(crate) fn to_px(&self, lat: f64, lon: f64) -> Pos2 {
+        self.world_to_px(tiles::world_xy_gcj(lat, lon))
+    }
+
+    pub(crate) fn to_lat_lon(&self, p: Pos2) -> (f64, f64) {
+        let (wx, wy) = self.px_to_world(p);
+        tiles::lat_lon_gcj(wx, wy)
+    }
+
+    /// The raster zoom level this camera's scale calls for.
+    fn tile_zoom(&self, pixels_per_point: f32) -> u8 {
+        tiles::zoom_for(self.rect.width(), self.span_lon, pixels_per_point)
+    }
+
+    /// Pan by a screen drag: the map follows the pointer.
+    fn pan(&self, drag: Vec2) -> MapView {
+        let cwx = self.center.0 - drag.x as f64 / self.px_per_world;
+        let cwy = self.center.1 - drag.y as f64 / self.px_per_world;
+        let (c_lat, c_lon) = tiles::lat_lon_gcj(cwx, cwy);
+        MapView { c_lon, c_lat, span_lon: self.span_lon }
     }
 }
 
@@ -404,6 +423,8 @@ struct Ctx<'a> {
     view: MapView,
     c: MapColors,
     t: Tokens,
+    /// Whether the online raster basemap is on; off paints only the offline schematic base.
+    online: bool,
 }
 
 // ---------------------------------------------------------------- the widget
@@ -430,19 +451,32 @@ pub(crate) fn draw_map(app: &mut lightcraft_ui_egui::LightcraftApp, ui: &mut Ui,
     painter.rect_filled(rect, 4.0, c.sea);
 
     handle_input(ui, st, &base, rect);
+    tiles::pump(ui.ctx());
     // the view may have moved with the input: build the camera fresh
     let t = Tokens::get(ui.ctx());
-    paint_base(&painter, rect, &st.map, &c);
-    let mut cx = Ctx { ui, painter, cam: Cam::new(&st.map, rect), view: st.map, c, t };
+    let cam = Cam::new(&st.map, rect);
+    paint_base(&painter, rect, &st.map, &cam, &c);
+    let online = !st.tiles_off;
+    let mut cx = Ctx { ui, painter, cam, view: st.map, c, t, online };
+    let tiles_drawn = if online { paint_tiles(&mut cx, rect) } else { false };
+    if tiles_drawn {
+        // the basemap is light even in the dark theme: labels need a dark ink to stay readable
+        cx.c.land_text = Color32::from_rgb(0x33, 0x33, 0x33);
+    }
     let (item_drag, item_hit) = if cx.view.span_lon <= THRESH { draw_thumbs(app, st, &points, &mut cx) } else { draw_bubbles(st, &points, &mut cx) };
     let base_drag = if base.dragged_by(PointerButton::Primary) { base.drag_delta() } else { Vec2::ZERO };
     apply_pan(&mut *cx.ui, st, &base, item_drag + base_drag, rect, item_hit);
-    if st.map.span_lon > INSET_SPAN {
-        paint_inset(&cx.t, &cx.painter, rect, &cx.c);
+    if tiles_drawn {
+        paint_attribution(&cx.t, &cx.painter, rect);
+    } else {
+        if st.map.span_lon > INSET_SPAN {
+            paint_inset(&cx.t, &cx.painter, rect, &cx.c);
+        }
+        paint_note(&cx.t, &cx.painter, rect);
     }
-    paint_note(&cx.t, &cx.painter, rect);
     draw_popup(st, &points, &mut cx, rect);
     draw_controls(st, &mut *cx.ui, rect);
+    draw_online_toggle(st, &mut *cx.ui, rect);
 }
 
 /// Wheel zoom around the pointer, double-click zoom, and the grab cursors.
@@ -482,8 +516,8 @@ fn handle_input(ui: &mut Ui, st: &mut State, base: &egui::Response, rect: Rect) 
     }
     if (factor - 1.0).abs() > 1e-9 {
         let cam = Cam::new(&st.map, rect);
-        let at = cam.to_lat_lon(&st.map, p);
-        st.map = zoom_around(st.map, factor, at, cam.span_lat);
+        let at = cam.to_lat_lon(p);
+        st.map = zoom_around(st.map, factor, at, rect);
         clamp_view(&mut st.map);
         st.map_sel = None;
         // the map owns the wheel while hovered; nothing behind it scrolls
@@ -495,25 +529,30 @@ fn handle_input(ui: &mut Ui, st: &mut State, base: &egui::Response, rect: Rect) 
         && rect.contains(p2)
     {
         let cam = Cam::new(&st.map, rect);
-        let at = cam.to_lat_lon(&st.map, p2);
-        st.map = zoom_around(st.map, 1.6, at, cam.span_lat);
+        let at = cam.to_lat_lon(p2);
+        st.map = zoom_around(st.map, 1.6, at, rect);
         clamp_view(&mut st.map);
         st.map_sel = None;
     }
 }
 
 /// Graticule, then the three land polygons (ear-clip fill + outline).
-fn paint_base(painter: &Painter, rect: Rect, view: &MapView, c: &MapColors) {
-    let cam = Cam::new(view, rect);
-    let mut lon = ((view.c_lon - view.span_lon * 0.5) / 10.0).ceil() * 10.0;
-    while lon <= view.c_lon + view.span_lon * 0.5 {
-        let x = cam.to_px(view, view.c_lat, lon).x;
+fn paint_base(painter: &Painter, rect: Rect, view: &MapView, cam: &Cam, c: &MapColors) {
+    let mut lon = (cam.to_lat_lon(rect.left_top()).1 / 10.0).ceil() * 10.0;
+    let right = cam.to_lat_lon(rect.right_bottom()).1;
+    let mut guard = 0;
+    while lon <= right && guard < 64 {
+        guard += 1;
+        let x = cam.to_px(view.c_lat, lon).x;
         painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, c.graticule));
         lon += 10.0;
     }
-    let mut lat = ((view.c_lat - cam.span_lat * 0.5) / 10.0).ceil() * 10.0;
-    while lat <= view.c_lat + cam.span_lat * 0.5 {
-        let y = cam.to_px(view, lat, view.c_lon).y;
+    let mut lat = (cam.to_lat_lon(rect.left_bottom()).0 / 10.0).ceil() * 10.0;
+    let top = cam.to_lat_lon(rect.left_top()).0;
+    let mut guard = 0;
+    while lat <= top && guard < 64 {
+        guard += 1;
+        let y = cam.to_px(lat, view.c_lon).y;
         painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, c.graticule));
         lat += 10.0;
     }
@@ -522,14 +561,98 @@ fn paint_base(painter: &Painter, rect: Rect, view: &MapView, c: &MapColors) {
         for tri in tris.iter() {
             for &i in tri {
                 let (la, lo) = poly[i];
-                mesh.colored_vertex(cam.to_px(view, la, lo), c.land);
+                mesh.colored_vertex(cam.to_px(la, lo), c.land);
             }
         }
         mesh.indices.extend(0..(tris.len() * 3) as u32);
         painter.add(Shape::Mesh(Arc::new(mesh)));
-        let pts: Vec<Pos2> = poly.iter().map(|(la, lo)| cam.to_px(view, *la, *lo)).collect();
+        let pts: Vec<Pos2> = poly.iter().map(|(la, lo)| cam.to_px(*la, *lo)).collect();
         painter.add(Shape::closed_line(pts, Stroke::new(1.2, c.edge)));
     }
+}
+
+// ---------------------------------------------------------------- the online basemap
+
+/// Draw AMap's raster tiles (from the texture cache) and ask for the missing ones. Returns whether
+/// at least one tile was painted, so the caller knows to show the attribution instead of the
+/// schematic-boundary note.
+fn paint_tiles(cx: &mut Ctx, rect: Rect) -> bool {
+    let zoom = cx.cam.tile_zoom(cx.ui.ctx().pixels_per_point());
+    let n = 1u32 << zoom;
+    let (wx0, wy0) = cx.cam.px_to_world(rect.min);
+    let (wx1, wy1) = cx.cam.px_to_world(rect.max);
+    let (x0, x1) = (tile_index(wx0, n, true), tile_index(wx1, n, false));
+    let (y0, y1) = (tile_index(wy0, n, true), tile_index(wy1, n, false));
+    let (cxw, cyw) = cx.cam.px_to_world(rect.center());
+    let mut keys = Vec::new();
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            keys.push(tiles::TileKey { z: zoom, x, y });
+        }
+    }
+    // the middle of the view is what the eye misses first while the mosaic fills
+    keys.sort_by(|a, b| tile_center_distance(*a, cxw, cyw, n).total_cmp(&tile_center_distance(*b, cxw, cyw, n)));
+    let mut drawn = false;
+    for key in keys {
+        let min = cx.cam.world_to_px((key.x as f64 / n as f64, key.y as f64 / n as f64));
+        let max = cx.cam.world_to_px(((key.x + 1) as f64 / n as f64, (key.y + 1) as f64 / n as f64));
+        let tile_rect = Rect::from_min_max(min, max);
+        if !tile_rect.intersects(rect) {
+            continue;
+        }
+        if let Some(texture) = tiles::texture(key) {
+            // a hair of overlap hides the seams the f32 screen rounding would leave
+            cx.painter.image(texture, tile_rect.expand(0.5), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            drawn = true;
+        }
+        if cx.online {
+            tiles::request(cx.ui.ctx(), key);
+        }
+    }
+    drawn
+}
+/// The tile containing a world-square coordinate; `first` takes the floor (the view's top-left
+/// corner), otherwise the ceiling (its bottom-right corner).
+fn tile_index(world: f64, n: u32, first: bool) -> u32 {
+    let scaled = world.clamp(0.0, 1.0) * n as f64;
+    let index = if first { scaled.floor() } else { scaled.ceil() };
+    (index as i64).clamp(0, n as i64 - 1) as u32
+}
+
+fn tile_center_distance(key: tiles::TileKey, wx: f64, wy: f64, n: u32) -> f64 {
+    let cx = (key.x as f64 + 0.5) / n as f64;
+    let cy = (key.y as f64 + 0.5) / n as f64;
+    (cx - wx).powi(2) + (cy - wy).powi(2)
+}
+
+/// AMap's terms want the source named wherever its tiles show.
+fn paint_attribution(t: &Tokens, painter: &Painter, rect: Rect) {
+    let galley = painter.layout_no_wrap(tiles::ATTRIBUTION.to_owned(), t.font(9.0), Color32::from_rgb(60, 60, 60));
+    let pad = vec2(5.0, 2.0);
+    let size = galley.size() + pad * 2.0;
+    let pill = Rect::from_min_size(pos2(rect.right() - size.x - 8.0, rect.bottom() - size.y - 8.0), size);
+    painter.rect_filled(pill, 3.0, Color32::from_white_alpha(215));
+    painter.galley(pill.min + pad, galley, Color32::from_rgb(60, 60, 60));
+}
+
+/// The online-basemap switch, bottom left. The map sends the viewed area to AMap's servers while
+/// it is on; switching it off leaves the offline schematic basemap.
+fn draw_online_toggle(st: &mut State, ui: &mut Ui, rect: Rect) {
+    let t = Tokens::get(ui.ctx());
+    egui::Area::new(Id::unique("geo-map-online")).fixed_pos(pos2(rect.left() + 8.0, rect.bottom() - 28.0)).order(egui::Order::Foreground).show(
+        ui.ctx(),
+        |ui| {
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 2)).fill(Color32::from_white_alpha(220)).corner_radius(4.0).show(ui, |ui| {
+                let mut on = !st.tiles_off;
+                let resp = ui.checkbox(&mut on, RichText::new(i18n::tr("Online map")).font(t.font(10.0)).color(Color32::from_rgb(60, 60, 60)));
+                widgets::register(ui, "geo:map:online", resp.rect);
+                let resp = resp.on_hover_text(i18n::tr("Loads map tiles from the AMap servers; the viewed area is sent to them."));
+                if resp.changed() {
+                    st.tiles_off = !on;
+                }
+            });
+        },
+    );
 }
 
 /// The South China Sea islands inset, bottom right, while the view is national or provincial.
@@ -559,10 +682,10 @@ fn paint_inset(t: &Tokens, painter: &Painter, rect: Rect, c: &MapColors) {
     }
 }
 
-/// The schematic-boundary note, bottom left of the map.
+/// The schematic-boundary note, bottom left of the map (above the online switch).
 fn paint_note(t: &Tokens, painter: &Painter, rect: Rect) {
     painter.text(
-        pos2(rect.left() + 10.0, rect.bottom() - 8.0),
+        pos2(rect.left() + 10.0, rect.bottom() - 34.0),
         Align2::LEFT_BOTTOM,
         i18n::tr("The boundaries are schematic."),
         t.font(9.5),
@@ -584,7 +707,7 @@ fn draw_bubbles(st: &mut State, points: &[MapPoint], cx: &mut Ctx) -> (Vec2, boo
     order.sort_by(|&a, &b| points[b].count.cmp(&points[a].count));
     for &pi in &order {
         let p = &points[pi];
-        let pos = cx.cam.to_px(&cx.view, p.center.0, p.center.1);
+        let pos = cx.cam.to_px(p.center.0, p.center.1);
         if !in_view(cx.cam.rect, pos, 40.0) {
             continue;
         }
@@ -634,7 +757,7 @@ fn draw_thumbs(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, poin
     let mut visible = vec![0usize; points.len()];
     for (pi, p) in points.iter().enumerate() {
         for (_, _, lat, lon, _) in &p.photos {
-            if in_view(cx.cam.rect, cx.cam.to_px(&cx.view, *lat, *lon), 30.0) {
+            if in_view(cx.cam.rect, cx.cam.to_px(*lat, *lon), 30.0) {
                 visible[pi] += 1;
             }
         }
@@ -648,7 +771,7 @@ fn draw_thumbs(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, poin
         let mut bounds: Option<Rect> = None;
         let mut painted = 0usize;
         for (id, file, lat, lon, dist_m) in &p.photos {
-            let pos = cx.cam.to_px(&cx.view, *lat, *lon);
+            let pos = cx.cam.to_px(*lat, *lon);
             if !in_view(cx.cam.rect, pos, 30.0) {
                 continue;
             }
@@ -718,11 +841,8 @@ fn draw_thumbs(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, poin
 /// popup, a click on an item keeps what it selected.
 fn apply_pan(ui: &mut Ui, st: &mut State, base: &egui::Response, drag: Vec2, rect: Rect, item_hit: bool) {
     if drag != Vec2::ZERO {
-        let w = (rect.width() as f64).max(1.0);
-        let h = (rect.height() as f64).max(1.0);
-        let span_lat = st.map.span_lat(rect.size());
-        st.map.c_lon -= drag.x as f64 * st.map.span_lon / w;
-        st.map.c_lat += drag.y as f64 * span_lat / h;
+        let cam = Cam::new(&st.map, rect);
+        st.map = cam.pan(drag);
         clamp_view(&mut st.map);
         st.map_sel = None;
         ui.ctx().request_repaint();
@@ -736,7 +856,7 @@ fn apply_pan(ui: &mut Ui, st: &mut State, base: &egui::Response, drag: Vec2, rec
 fn draw_popup(st: &mut State, points: &[MapPoint], cx: &mut Ctx, rect: Rect) {
     let Some(sel) = st.map_sel.clone() else { return };
     let Some(p) = points.iter().find(|p| p.path == sel) else { return };
-    let pos = cx.cam.to_px(&cx.view, p.center.0, p.center.1);
+    let pos = cx.cam.to_px(p.center.0, p.center.1);
     let size = vec2(190.0, 118.0);
     let mut origin = pos2(pos.x + bubble_radius(p.count) + 10.0, pos.y - 12.0);
     origin.x = origin.x.min(rect.right() - size.x - 6.0).max(rect.left() + 6.0);
@@ -811,8 +931,7 @@ fn draw_controls(st: &mut State, ui: &mut Ui, rect: Rect) {
             ui.horizontal(|ui| {
                 let zoom = |st: &mut State, factor: f64, rect: Rect| {
                     let at = (st.map.c_lat, st.map.c_lon);
-                    let span_lat = st.map.span_lat(rect.size());
-                    st.map = zoom_around(st.map, factor, at, span_lat);
+                    st.map = zoom_around(st.map, factor, at, rect);
                     clamp_view(&mut st.map);
                 };
                 if Button::icon_only(icons::Icon::Plus, "Zoom in").small().widget("geo:map:zoomin").show(ui).clicked() {

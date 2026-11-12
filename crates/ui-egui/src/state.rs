@@ -58,6 +58,10 @@ pub struct UiState {
     pub presets: bool,
     /// The Extensions panel (`view.extensionPage`): the pages the desktop host registered.
     pub extension_open: bool,
+    /// The saved layout's separately docked Extensions panel has been merged into the Tools tab
+    /// group once this session; a later manual move is left alone until the next open or restart.
+    #[serde(skip)]
+    pub extension_tabbed: bool,
     /// Presets column: show a live thumbnail of the photo with each preset.
     pub preset_thumbs: bool,
     pub filmstrip: bool,
@@ -409,6 +413,7 @@ impl Default for UiState {
             right_hidden: RightPanel::None,
             presets: false,
             extension_open: false,
+            extension_tabbed: false,
             preset_thumbs: false,
             filmstrip: true,
             zoom: Zoom::Fit,

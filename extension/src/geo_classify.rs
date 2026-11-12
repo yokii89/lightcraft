@@ -17,13 +17,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime};
 
-use egui::{Align, RichText, Ui};
+use egui::{Align, RichText, Sense, Ui, vec2};
 use lightcraft_catalog::{Meta, Op, PhotoId};
 use lightcraft_engine::Session;
 use lightcraft_engine::catalog::keywords;
 use lightcraft_engine::cmd::keywords as keywords_cmd;
 use lightcraft_geocode::{GEONAMES_FILES, GeoNames, LatLon};
 use lightcraft_ui_egui::button::Button;
+use lightcraft_ui_egui::icons::{self, Icon};
 use lightcraft_ui_egui::progress::spinner;
 use lightcraft_ui_egui::text_field::TextField;
 use lightcraft_ui_egui::theme::Tokens;
@@ -31,7 +32,10 @@ use lightcraft_ui_egui::{LightcraftApp, i18n};
 use serde_json::Value;
 
 use crate::scope::{self, Scope};
-use crate::ui::{card, field, hint, section, status_dot, trn, warning};
+use crate::ui::{
+    Pill, action_bar, action_note, card, card_head, field, hint, path_example, primary_action, split_page, status_pill, success_card, trn, warning,
+    with_alpha,
+};
 
 mod map;
 
@@ -148,6 +152,8 @@ struct State {
     /// The map's view and what is selected on it.
     map: map::MapView,
     map_sel: Option<String>,
+    /// The online AMap basemap is switched off (the offline schematic map shows instead).
+    tiles_off: bool,
     /// The photo shown in the detail view from a thumbnail click (for the ring).
     photo_sel: Option<PhotoId>,
     // the outcome
@@ -199,7 +205,10 @@ fn lock() -> MutexGuard<'static, State> {
 #[cfg(test)]
 pub(crate) fn page_test_lock() -> MutexGuard<'static, ()> {
     static TEST_MU: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_MU.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(PoisonError::into_inner)
+    let guard = TEST_MU.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(PoisonError::into_inner);
+    // the shared tile store holds egui textures of whichever context made them
+    crate::tiles::reset_for_test();
+    guard
 }
 
 // ---------------------------------------------------------------- entry points
@@ -422,128 +431,161 @@ fn back_to_idle(st: &mut State) {
 // ---------------------------------------------------------------- drawing
 
 fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let t = Tokens::get(ui.ctx());
+    let footer_h = match st.phase {
+        Phase::Idle => 66.0,
+        Phase::Review => 62.0,
+        _ => 0.0,
+    };
+    let (body, footer) = split_page(ui, footer_h);
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
     if st.phase == Phase::Review {
         // the map fills the panel, so the review runs without the scroll area
-        draw_review(app, ui, st);
-        return;
+        draw_review(app, &mut body_ui, st);
+    } else {
+        egui::ScrollArea::vertical().id_salt("geo-scroll").auto_shrink([false, false]).show(&mut body_ui, |ui| {
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 }).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match st.phase {
+                    Phase::Review => {} // handled above
+                    Phase::Applying => {
+                        let t = Tokens::get(ui.ctx());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            spinner(ui, 14.0);
+                            ui.label(RichText::new(i18n::tr("Writing the keywords…")).font(t.font(12.0)).color(t.text_label));
+                        });
+                    }
+                    Phase::Done => draw_done(app, ui, st),
+                    Phase::Idle => draw_idle(app, ui, st),
+                }
+            });
+        });
     }
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.label(RichText::new(i18n::tr("Classify by Location")).font(t.semibold(14.0)).color(t.text));
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(i18n::tr("Group photos by where they were taken and write the place as a keyword.")).font(t.font(11.0)).color(t.text_dim),
-        );
-        ui.add_space(10.0);
-        match st.phase {
-            Phase::Review => {} // handled above
-            Phase::Applying => {
-                ui.horizontal(|ui| {
-                    spinner(ui, 14.0);
-                    ui.label(RichText::new(i18n::tr("Writing the keywords…")).font(t.font(12.0)).color(t.text_label));
-                });
+    let Some(bar) = footer else { return };
+    let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+    action_bar(&mut bar_ui, |ui| match st.phase {
+        Phase::Idle => {
+            let (selected, view, library) = scope::counts(app, &mut st.lib_count);
+            let in_scope = scope::count_of(st.scope, (selected, view, library));
+            let ready = dataset_ready(st.status.as_ref());
+            let label = trn("Classify ({n} photos)", &[("n", in_scope.to_string())]);
+            if primary_action(ui, &label, ready && in_scope > 0, "geo:start") {
+                run_review(app, st);
             }
-            Phase::Done => draw_done(app, ui, st),
-            Phase::Idle => draw_idle(app, ui, st),
+            let note = if !ready { i18n::tr("Download the place names once.") } else { i18n::tr("One undo step reverts the whole batch.") };
+            action_note(ui, note);
         }
+        Phase::Review => {
+            let all = groups(&st.parent, &st.places);
+            let (photos, _) = st.review_counts(&all);
+            let label = trn("Write to {n} photos", &[("n", photos.to_string())]);
+            if primary_action(ui, &label, photos > 0, "geo:write") {
+                write_review(app, st);
+            }
+            let out = st.without_gps.saturating_add(st.unmatched);
+            let note = if out > 0 {
+                trn("Not written: {n} photos", &[("n", out.to_string())])
+            } else {
+                i18n::tr("The write is one undo step; revert it from Edit ▸ Undo.").to_string()
+            };
+            action_note(ui, &note);
+        }
+        _ => {}
     });
 }
 
-/// The idle page: the dataset card, the scope, the parent keyword, the one main action.
+/// The idle page: the dataset card, the scope, the parent keyword. The one main action lives in
+/// the sticky footer.
 fn draw_idle(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let (selected, view, library) = scope::counts(app, &mut st.lib_count);
+    let status = st.status.clone();
+    let downloading = status.as_ref().and_then(|v| v.get("downloading")).and_then(Value::as_bool).unwrap_or(false);
+    let ready = dataset_ready(status.as_ref());
     card(ui, |ui| {
-        section(ui, "Place names dataset");
+        let (pill, kind) = if downloading {
+            ("Downloading…", Pill::Busy)
+        } else if ready {
+            ("Ready", Pill::Ready)
+        } else {
+            ("Not downloaded", Pill::Idle)
+        };
+        card_head(ui, Icon::Info, "Place names", |ui| status_pill(ui, pill, kind));
+        let t = Tokens::get(ui.ctx());
+        let title = if downloading {
+            i18n::tr("Downloading…").to_string()
+        } else if ready {
+            status
+                .as_ref()
+                .and_then(|v| v.get("bytes"))
+                .and_then(Value::as_u64)
+                .map(|bytes| trn("Ready · {mb} MB", &[("mb", format!("{:.1}", bytes as f64 / (1 << 20) as f64))]))
+                .unwrap_or_else(|| i18n::tr("Ready").to_string())
+        } else {
+            i18n::tr("Offline place names").to_string()
+        };
+        let line = if ready {
+            i18n::tr("The place names list towns of 15 000 people or more.")
+        } else {
+            i18n::tr("Download once, then lookups are fully offline. About 3 MB.")
+        };
         ui.horizontal(|ui| {
-            let t = Tokens::get(ui.ctx());
-            let status = st.status.clone();
-            let downloading = status.as_ref().and_then(|v| v.get("downloading")).and_then(Value::as_bool);
-            match (dataset_ready(status.as_ref()), downloading) {
-                (_, Some(true)) => {
-                    spinner(ui, 12.0);
-                    ui.label(RichText::new(i18n::tr("Downloading…")).font(t.font(11.5)).color(t.text_label));
-                }
-                (true, _) => {
-                    status_dot(ui, t.accent);
-                    ui.label(RichText::new(i18n::tr("Ready")).font(t.font(11.5)).color(t.text_label));
-                    if let Some(bytes) = status.as_ref().and_then(|v| v.get("bytes")).and_then(Value::as_u64) {
-                        ui.label(
-                            RichText::new(trn("{mb} MB", &[("mb", format!("{:.1}", bytes as f64 / (1 << 20) as f64))]))
-                                .font(t.font(10.5))
-                                .color(t.text_dim),
-                        );
+            let (tile, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(tile, 7.0, with_alpha(t.accent, 20));
+            icons::paint(p, tile.shrink(7.0), Icon::Info, t.accent);
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).font(t.font(11.5)).color(t.text_label));
+                ui.label(RichText::new(line).font(t.font(10.0)).color(t.text_dim));
+            });
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ready {
+                    if Button::new(i18n::tr("Re-check")).ghost().small().widget("geo:recheck").show(ui).clicked() {
+                        status_soon(st);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if Button::new(i18n::tr("Re-check")).ghost().small().widget("geo:recheck").show(ui).clicked() {
-                            status_soon(st);
-                        }
-                    });
+                } else if Button::new(i18n::tr("Download")).secondary().small().widget("geo:download").show(ui).clicked() {
+                    start_download(app, st);
                 }
-                (false, _) => {
-                    status_dot(ui, t.text_dim);
-                    ui.label(RichText::new(i18n::tr("Not downloaded")).font(t.font(11.5)).color(t.text_label));
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if Button::new(i18n::tr("Download place names")).secondary().small().widget("geo:download").show(ui).clicked() {
-                            start_download(app, st);
-                        }
-                    });
-                }
-            }
+            });
         });
         if let Some(e) = &st.error {
             ui.add_space(4.0);
             warning(ui, e);
         }
-        ui.add_space(6.0);
-        hint(
-            ui,
-            i18n::tr(
-                "The offline place names list towns of 15 000 people or more. A photo taken in a smaller town classifies by its country, or by the nearest larger city (shown, never written).",
-            ),
-        );
-        if let Some(attribution) = st.status.as_ref().and_then(|v| v.get("attribution")).and_then(Value::as_str) {
-            hint(ui, attribution);
-        }
+        ui.add_space(7.0);
+        ui.separator();
+        ui.add_space(4.0);
+        let attribution = status.as_ref().and_then(|v| v.get("attribution")).and_then(Value::as_str).unwrap_or("GeoNames · CC-BY 4.0");
+        hint(ui, attribution);
     });
     card(ui, |ui| {
-        section(ui, "Scope");
+        card_head(ui, Icon::GridSquare, "Scope", |_| {});
         if let Some(scope) = scope::selector(ui, st.scope, (selected, view, library)) {
             st.scope = scope;
         }
+        ui.add_space(6.0);
+        hint(ui, i18n::tr("Only photos with a GPS position are classified."));
     });
     card(ui, |ui| {
-        section(ui, "Keywords");
+        card_head(ui, Icon::Tag, "Keywords", |_| {});
         field(ui, "Parent keyword", |ui| {
             let resp = TextField::singleline("geo:parent", &mut st.parent).hint(PARENT_DEFAULT).width(120.0).show(ui);
             if resp.response.changed() || resp.committed() {
                 st.parent = keywords::clean(&st.parent);
             }
         });
-        ui.add_space(6.0);
         let parent = if st.parent.trim().is_empty() { i18n::tr("Country").to_string() } else { st.parent.trim().to_string() };
-        hint(ui, &trn("Saved as Parent|Country|City — for example {path}.", &[("path", format!("{parent}|中国|杭州"))]));
+        path_example(ui, &[parent.as_str(), "中国", "杭州"]);
+        hint(ui, i18n::tr("A photo taken in a smaller town classifies by its country."));
     });
-    let in_scope = scope::count_of(st.scope, (selected, view, library));
-    let ready = dataset_ready(st.status.as_ref());
-    let label = trn("Classify ({n} photos)", &[("n", in_scope.to_string())]);
-    let enabled = ready && in_scope > 0;
-    if Button::new(&label).primary().enabled(enabled).widget("geo:start").show(ui).clicked() {
-        run_review(app, st);
-    }
-    if !ready {
-        hint(ui, i18n::tr("Download the place names once; after that every lookup is offline and no position ever leaves this machine."));
-    }
 }
 
-/// The review: the summary card, then the map as the main view, the legend and the write.
+/// The review: the summary card, then the map as the main view. The write sits in the sticky
+/// footer.
 fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let t = Tokens::get(ui.ctx());
-    ui.add_space(4.0);
-    ui.label(RichText::new(i18n::tr("Classify by Location")).font(t.semibold(14.0)).color(t.text));
-    ui.add_space(2.0);
-    ui.label(RichText::new(i18n::tr("Group photos by where they were taken and write the place as a keyword.")).font(t.font(11.0)).color(t.text_dim));
-    ui.add_space(10.0);
     if let Some(e) = st.apply_error.clone() {
         warning(ui, &trn("The write failed: {e}", &[("e", e)]));
         ui.add_space(4.0);
@@ -552,13 +594,17 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let (photos, count) = st.review_counts(&all);
     let abroad: usize = all.iter().filter(|g| !g.iso.eq_ignore_ascii_case("CN")).map(|g| g.places.len()).sum();
     card(ui, |ui| {
+        card_head(ui, Icon::Check, "Ready to write", |_| {});
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(trn("Ready to write: {p} photos in {g} places", &[("p", photos.to_string()), ("g", count.to_string())]))
-                    .font(t.font(11.5))
-                    .color(t.text_label),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(photos.to_string()).font(t.semibold(15.0)).color(t.text));
+            ui.label(RichText::new(i18n::tr("Photos")).font(t.font(10.5)).color(t.text_dim));
+            ui.label(RichText::new("·").font(t.font(10.5)).color(t.text_disabled));
+            ui.label(RichText::new(count.to_string()).font(t.semibold(15.0)).color(t.text));
+            ui.label(RichText::new(i18n::tr("Places")).font(t.font(10.5)).color(t.text_dim));
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if Button::new(i18n::tr("Discard all")).secondary().small().widget("geo:discard").show(ui).clicked() {
                     back_to_idle(st);
                 }
@@ -567,52 +613,36 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 }
             });
         });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(trn(
+        ui.add_space(5.0);
+        hint(
+            ui,
+            &trn(
                 "Outside China: {n} photos · no match: {m} · no GPS: {k} — not shown, not written",
                 &[("n", abroad.to_string()), ("m", st.unmatched.to_string()), ("k", st.without_gps.to_string())],
-            ))
-            .font(t.font(10.0))
-            .color(t.text_dim),
+            ),
         );
     });
     map::draw_map(app, ui, st, &all);
     ui.add_space(6.0);
     hint(ui, i18n::tr("Bubble size = photo count · scroll to zoom, drag to pan · zoom in for photo thumbnails"));
-    if photos > 0 {
-        ui.add_space(4.0);
-        let text = trn("Write to {n} photos", &[("n", photos.to_string())]);
-        if Button::new(&text).primary().widget("geo:write").show(ui).clicked() {
-            write_review(app, st);
-        }
-    }
-    ui.add_space(2.0);
-    hint(ui, i18n::tr("The keywords appear in the Keywords panel and, with auto-write XMP, in the photos' sidecars."));
 }
 
 /// The done page: what was written, the undo, another round.
 fn draw_done(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let t = Tokens::get(ui.ctx());
     let Some(a) = st.applied.as_ref().map(|a| (a.photos, a.keywords, a.undone)) else { return };
     let (photos, count, undone) = a;
+    let title = trn("Wrote {n} photos", &[("n", photos.to_string())]);
+    let body = if count == 0 {
+        i18n::tr("Everything the model found was already on the photos.").to_string()
+    } else if undone {
+        i18n::tr("The batch was undone.").to_string()
+    } else {
+        String::new()
+    };
+    let out = st.without_gps.saturating_add(st.unmatched);
+    let stats = [(i18n::tr("Photos"), photos.to_string()), (i18n::tr("Keywords"), count.to_string()), (i18n::tr("Not written"), out.to_string())];
+    success_card(ui, &title, &body, &stats);
     card(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("✓").font(t.semibold(13.0)).color(t.accent));
-            ui.label(RichText::new(trn("Wrote {n} photos", &[("n", photos.to_string())])).font(t.semibold(12.5)).color(t.text));
-        });
-        ui.add_space(4.0);
-        if count > 0 {
-            hint(ui, &trn("{k} keywords added", &[("k", count.to_string())]));
-        } else {
-            hint(ui, i18n::tr("Everything the model found was already on the photos."));
-        }
-        if undone {
-            hint(ui, i18n::tr("The batch was undone."));
-        } else {
-            hint(ui, i18n::tr("All changes are one undo step: Edit ▸ Undo reverts the whole batch."));
-        }
-        ui.add_space(8.0);
         ui.horizontal(|ui| {
             let undo_ok = !undone && app.session.undo.last().is_some_and(|e| e.label == UNDO_LABEL);
             if Button::new(i18n::tr("Undo this batch")).secondary().small().enabled(undo_ok).widget("geo:undo").show(ui).clicked() {
@@ -622,6 +652,8 @@ fn draw_done(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 back_to_idle(st);
             }
         });
+        ui.add_space(5.0);
+        hint(ui, i18n::tr("All changes are one undo step: Edit ▸ Undo reverts the whole batch."));
     });
 }
 

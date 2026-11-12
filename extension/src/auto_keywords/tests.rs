@@ -570,6 +570,29 @@ fn the_service_card_shows_exactly_one_half_of_the_toggle() {
 }
 
 #[test]
+fn the_settings_footer_holds_the_generate_action_and_advanced_stays_folded() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(420.0, 900.0), 1.0, 0.0, vec![]);
+    let mut st = State { phase: Phase::Ready, ..State::default() };
+    st.service.phase = super::server::Phase::Ready;
+    st.service.device = "cuda".to_string();
+    let _ = view.run(input.clone(), |ui| super::draw(&mut app, ui, &mut st));
+    let text = view.painted_text().join("\n");
+    assert!(text.contains("Generate keywords"), "the footer's one action: {text}");
+    let registered: Vec<String> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().map(|(id, _)| id).collect();
+    assert!(registered.iter().any(|id| id == "akw:generate"), "the action is in the sticky footer: {registered:?}");
+    assert!(registered.iter().any(|id| id == "akw:mode:review"), "the write mode cards are registered: {registered:?}");
+    assert!(registered.iter().any(|id| id == "akw:mode:direct"));
+    assert!(registered.iter().any(|id| id == "akw:advanced"), "the advanced toggle: {registered:?}");
+    assert!(!text.contains("Python interpreter"), "the technical fields stay folded: {text}");
+    st.advanced = true;
+    let _ = view.run(input, |ui| super::draw(&mut app, ui, &mut st));
+    let text = view.painted_text().join("\n");
+    assert!(text.contains("Python interpreter"), "the advanced fields open: {text}");
+}
+
+#[test]
 fn the_page_survives_a_run_against_a_dead_service() {
     // a run whose service is gone: every photo fails, the failure summary shows, the settings
     // survive (§9 Failed)

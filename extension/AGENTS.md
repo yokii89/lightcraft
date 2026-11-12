@@ -67,7 +67,8 @@ The root house rules apply in full, including:
   `lightcraft_extension::install(&mut app)`
 - `crates/ui-egui/src/ext.rs` — `ExtensionPage`, `register_extension_page`, the panel body
 - `crates/ui-egui/src/docking.rs`, `crates/ui-egui/src/state.rs` — `Panel::Extension`,
-  `extension_open`
+  `extension_open`, and the Extensions tab sharing the Tools tab group (`extension_tabbed` is a
+  session-only flag for the one-time merge of an older two-column layout)
 - `crates/ui-egui/src/menus/*` — `view.extensionPage`
 - `crates/ui-egui/src/panels/left.rs`, `crates/ui-egui/src/icons.rs` — the sidebar block and its icon
 - `crates/ui-egui/locales/zh-hans.json` — translations for new strings
@@ -89,5 +90,9 @@ cargo fmt --all -- --check
 cargo test -p lightcraft-extension
 cargo clippy -p lightcraft-extension --all-targets -- -D warnings
 ```
+
+extension\参考 是两个参考项目，用于展示如何实现一个简单的图片地图功能，我们准备参考其中的一些功能实现。
+我们计划使用 extension\参考\map-main 作为我们的地图参考，因为它的地图更加高清
+计划使用 extension\参考\picmap-main 作为我们的图片地图功能。
 
 Then check the diff: nothing outside the seams above.

@@ -15,6 +15,7 @@ pub(crate) mod auto_keywords;
 pub(crate) mod geo_classify;
 pub(crate) mod hub;
 pub(crate) mod scope;
+pub(crate) mod tiles;
 pub(crate) mod ui;
 
 /// The pages the host renders: the hub, the extensions' level-1 page.

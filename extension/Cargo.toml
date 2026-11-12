@@ -17,9 +17,11 @@ lightcraft-catalog = { workspace = true }
 lightcraft-codecs = { workspace = true }
 lightcraft-geocode = { workspace = true }
 egui = { workspace = true }
+image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+ureq = "3"
 
 [dev-dependencies]
 lightcraft-testkit = { workspace = true }

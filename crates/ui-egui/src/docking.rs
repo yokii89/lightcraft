@@ -118,6 +118,19 @@ pub fn default_workspace() -> Workspace {
 /// Where a panel without a usable recorded place opens: its own column at its dock's window
 /// edge, or Presets on the photo side of Tools while Tools is in the end dock.
 fn home(workspace: &Workspace, panel: Panel) -> Location<Panel> {
+    // The Extensions panel is a tab of the Tools panel: one side panel, two tabs. Without a
+    // docked Tools panel it keeps a column of its own.
+    if panel == Panel::Extension && workspace.layout.contains(&Panel::Tools) {
+        return Location {
+            floating: None,
+            anchor: Some(Panel::Tools),
+            placement: Placement::Tab { before: None },
+            size: None,
+            stack: None,
+            sibling: Vec::new(),
+            group: None,
+        };
+    }
     let column = ColumnLocation { side: panel.home_side(), width: panel.home_width(), iconic: false, iconic_width: None };
     let docked_at =
         |other: Panel| workspace.layout.location(&other).ok().and_then(|location| location.group).and_then(|group| group.column).map(|c| c.side);
@@ -135,6 +148,20 @@ fn home(workspace: &Workspace, panel: Panel) -> Location<Panel> {
 
 fn error(error: DockError) -> String {
     error.to_string()
+}
+
+/// Put the Extensions panel into the Tools tab group: one side panel, two tabs. A panel already
+/// tabbed with Tools stays where it is, and a floating one keeps the user's choice.
+fn merge_extension_into_tools(workspace: &mut Workspace) -> Result<(), String> {
+    let extension = workspace.layout.location(&Panel::Extension).map_err(error)?;
+    let tools = workspace.layout.location(&Panel::Tools).map_err(error)?;
+    if extension.floating.is_some() || tools.floating.is_some() {
+        return Ok(());
+    }
+    if extension.anchor == Some(Panel::Tools) && matches!(extension.placement, Placement::Tab { .. }) {
+        return Ok(());
+    }
+    apply(workspace, Action::Move { panel: Panel::Extension, anchor: Panel::Tools, placement: Placement::Tab { before: None } })
 }
 
 /// The shared checks plus LightCraft's own: saved settings cannot float, hide, share or
@@ -301,6 +328,9 @@ pub(crate) fn reveal_command(app: &mut crate::LightcraftApp, id: &str) -> Result
     if let Some(panel) = panel {
         let mut workspace = app.ui.docking.clone().unwrap_or_else(|| from_ui(app));
         sync(&mut workspace, app)?;
+        if panel == Panel::Extension && workspace.layout.contains(&Panel::Tools) && workspace.layout.contains(&Panel::Extension) {
+            merge_extension_into_tools(&mut workspace)?;
+        }
         reveal(&mut workspace, panel)?;
         cancel_replaced_gesture(app, Some(&workspace));
         app.ui.docking = Some(workspace);
@@ -356,6 +386,14 @@ fn command_impl(app: &mut crate::LightcraftApp, reset: bool, params: &Value, ren
 pub fn show(app: &mut crate::LightcraftApp, ui: &mut egui::Ui) {
     let t = crate::theme::Tokens::get(ui.ctx());
     let mut workspace = app.ui.docking.clone().unwrap_or_else(|| from_ui(app));
+    // A saved layout from before the Extensions panel shared the Tools tab group is merged once
+    // per session; a later manual move stays as the user left it until the next open or restart.
+    if !app.ui.extension_tabbed {
+        app.ui.extension_tabbed = true;
+        if workspace.layout.contains(&Panel::Extension) && workspace.layout.contains(&Panel::Tools) {
+            let _ = merge_extension_into_tools(&mut workspace);
+        }
+    }
     if let Err(error) = validate(&workspace).and_then(|()| sync(&mut workspace, app)) {
         app.ui.toast = Some((crate::i18n::tr_format!("Panel layout could not be restored: {error}", error = error), app.tick_now() + 8.0, None));
         workspace = from_ui(app);
@@ -611,6 +649,81 @@ mod tests {
         set_visible(&mut workspace, Panel::Extension, false).unwrap();
         publish_visibility(&mut app, &workspace);
         assert!(!app.ui.extension_open, "closing the panel turns its state off");
+    }
+
+    /// The Extensions panel and the Tools panel are one side panel with two tabs, not two
+    /// columns.
+    #[test]
+    fn the_extension_panel_opens_as_a_tab_of_the_tools_panel() {
+        let mut app = app_with_widths();
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        assert!(exposed_in(&workspace, Panel::Extension));
+        assert_eq!(columns(&workspace, Side::End), [(app.ui.right_width, vec![vec![Panel::Tools, Panel::Extension]])]);
+        assert!(workspace.layout.floating.is_empty(), "the panel is a docked tab, not a window");
+    }
+
+    /// A layout saved before the two panels shared a column merges into the Tools tabs.
+    #[test]
+    fn a_saved_separate_extension_column_merges_into_the_tools_tabs() {
+        let mut app = app_with_widths();
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        apply(&mut workspace, Action::Move { panel: Panel::Extension, anchor: Panel::Tools, placement: Placement::Column { after: true } }).unwrap();
+        assert_eq!(columns(&workspace, Side::End).len(), 2, "the old layout: an Extension column of its own");
+        merge_extension_into_tools(&mut workspace).unwrap();
+        assert_eq!(columns(&workspace, Side::End), [(app.ui.right_width, vec![vec![Panel::Tools, Panel::Extension]])]);
+    }
+
+    /// The merge runs once per session: a tab the user drags back out is not pulled in every
+    /// frame, and the next open from the entry moves it back.
+    #[test]
+    fn opening_the_extension_from_the_entry_merges_it_back_into_the_tools_tabs() {
+        let mut app = app_with_widths();
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        apply(&mut workspace, Action::Move { panel: Panel::Extension, anchor: Panel::Tools, placement: Placement::Column { after: true } }).unwrap();
+        sync(&mut workspace, &app).unwrap();
+        assert_eq!(columns(&workspace, Side::End).len(), 2, "sync leaves the manual move alone");
+        app.ui.docking = Some(workspace);
+        reveal_command(&mut app, "view.extensionPage").unwrap();
+        let workspace = app.ui.docking.as_ref().unwrap();
+        assert_eq!(columns(workspace, Side::End), [(app.ui.right_width, vec![vec![Panel::Tools, Panel::Extension]])]);
+        assert!(exposed_in(workspace, Panel::Extension));
+    }
+
+    /// Without a docked Tools panel the Extensions panel keeps a column of its own, and the
+    /// entry does not force the Tools panel open.
+    #[test]
+    fn the_extension_panel_keeps_its_own_column_without_a_tools_panel() {
+        let mut app = app_with_widths();
+        app.ui.right = crate::state::RightPanel::None;
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        assert!(!workspace.layout.contains(&Panel::Tools));
+        assert!(exposed_in(&workspace, Panel::Extension));
+        let location = workspace.layout.location(&Panel::Extension).unwrap();
+        assert!(location.group.is_some_and(|group| group.column.is_some()), "its own column");
+        validate(&workspace).unwrap();
+    }
+
+    /// Closing the extension tab keeps the Tools tab, and reopening restores the tab.
+    #[test]
+    fn closing_and_reopening_the_extension_keeps_the_tools_tab() {
+        let mut app = app_with_widths();
+        app.ui.extension_open = true;
+        let mut workspace = from_ui(&app);
+        sync(&mut workspace, &app).unwrap();
+        set_visible(&mut workspace, Panel::Extension, false).unwrap();
+        assert!(exposed_in(&workspace, Panel::Tools));
+        set_visible(&mut workspace, Panel::Extension, true).unwrap();
+        let location = workspace.layout.location(&Panel::Extension).unwrap();
+        assert_eq!(location.anchor, Some(Panel::Tools));
+        assert!(matches!(location.placement, Placement::Tab { .. }));
     }
 
     #[test]

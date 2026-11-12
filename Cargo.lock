@@ -3815,9 +3815,10 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-extension"
-version = "0.18.0"
+version = "0.21.1"
 dependencies = [
  "egui",
+ "image",
  "lightcraft-catalog",
  "lightcraft-codecs",
  "lightcraft-engine",
@@ -3829,6 +3830,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -6975,6 +6977,7 @@ dependencies = [
  "rustls-platform-verifier",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots",
 ]
 
 [[package]]

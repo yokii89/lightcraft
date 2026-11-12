@@ -168,10 +168,10 @@ fn the_projection_round_trips_through_the_camera() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(400.0, 300.0));
     let cam = map::Cam::new(&view, rect);
     for (lat, lon) in [(39.9, 116.4), (30.27, 120.16), (18.25, 109.5), (43.83, 87.62)] {
-        let p = cam.to_px(&view, lat, lon);
+        let p = cam.to_px(lat, lon);
         assert!(rect.contains(p), "{lat},{lon} → {p:?} outside the map");
-        let (lat2, lon2) = cam.to_lat_lon(&view, p);
-        // pixels are f32, so the round trip carries a small quantisation error
+        let (lat2, lon2) = cam.to_lat_lon(p);
+        // pixels are f32 and the GCJ-02 inverse iterates, so the round trip carries a small error
         assert!((lat2 - lat).abs() < 1e-3 && (lon2 - lon).abs() < 1e-3, "round trip of {lat},{lon} gave {lat2},{lon2}");
     }
 }
@@ -182,11 +182,11 @@ fn zooming_keeps_the_point_under_the_anchor() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(400.0, 300.0));
     let cam = map::Cam::new(&view, rect);
     let anchor_px = egui::pos2(120.0, 90.0);
-    let at = cam.to_lat_lon(&view, anchor_px);
-    let zoomed = map::zoom_around(view, 2.0, at, cam.span_lat);
+    let at = cam.to_lat_lon(anchor_px);
+    let zoomed = map::zoom_around(view, 2.0, at, rect);
     let cam2 = map::Cam::new(&zoomed, rect);
-    let (lat2, lon2) = cam2.to_lat_lon(&zoomed, anchor_px);
-    assert!((lat2 - at.0).abs() < 1e-9 && (lon2 - at.1).abs() < 1e-9, "the anchor moved: {lat2},{lon2} vs {at:?}");
+    let (lat2, lon2) = cam2.to_lat_lon(anchor_px);
+    assert!((lat2 - at.0).abs() < 1e-6 && (lon2 - at.1).abs() < 1e-6, "the anchor moved: {lat2},{lon2} vs {at:?}");
     assert!((zoomed.span_lon - view.span_lon / 2.0).abs() < 1e-9, "span did not halve");
 }
 
@@ -197,7 +197,7 @@ fn the_view_is_clamped_to_china() {
     assert!(v.span_lon <= 70.0 && (75.0..=134.0).contains(&v.c_lon) && (16.0..=53.0).contains(&v.c_lat));
     let mut v = MapView { c_lon: 0.0, c_lat: 0.0, span_lon: 0.1 };
     map::clamp_view(&mut v);
-    assert!(v.span_lon >= 1.2, "a too-deep zoom is lifted to the floor");
+    assert!(v.span_lon >= 0.02, "a too-deep zoom is lifted to the street-level floor");
 }
 
 // ---------------------------------------------------------------- the map's points
@@ -239,9 +239,18 @@ fn the_page_renders_headless_and_names_the_dataset_state() {
     let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(360.0, 780.0), 1.0, 0.0, vec![]);
     let _ = view.run(input, |ui| page(&mut app, ui));
     let text = view.painted_text().join("\n");
-    assert!(text.contains("Classify by Location"), "the page's title: {text}");
-    assert!(text.contains("Not downloaded"), "the demo session has no place names: {text}");
+    assert!(text.contains("Place names"), "the dataset card: {text}");
+    assert!(
+        text.contains("Not downloaded") || text.contains("Ready"),
+        "the page names the dataset state (a machine may already hold the dataset): {text}"
+    );
     assert!(text.contains("CC-BY 4.0"), "the GeoNames attribution is shown: {text}");
+    let registered: Vec<(String, egui::Rect)> = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    assert!(
+        registered.iter().any(|(id, _)| id == "geo:download" || id == "geo:recheck"),
+        "the dataset action (download or re-check): {registered:?}"
+    );
+    assert!(registered.iter().any(|(id, _)| id == "geo:start"), "the start action is in the sticky footer: {registered:?}");
 }
 
 #[test]
@@ -262,6 +271,7 @@ fn the_review_renders_the_map_with_bubbles_headless() {
     assert!(registered.iter().any(|(id, _)| id == "geo:map"), "the map is registered for automation");
     assert!(registered.iter().any(|(id, _)| id == "geo:map:bubble:0"), "the first bubble is clickable");
     assert!(registered.iter().any(|(id, _)| id == "geo:map:bubble:1"), "the second bubble is clickable");
+    assert!(registered.iter().any(|(id, _)| id == "geo:write"), "the write action is in the sticky footer");
     // the mainland outline: a filled/closed path with nearly all of its vertices
     let big = view
         .painted_shapes()
@@ -272,6 +282,29 @@ fn the_review_renders_the_map_with_bubbles_headless() {
         })
         .max();
     assert!(big.is_some_and(|n| n >= 90), "the schematic outline is painted: biggest path {big:?}");
+    *lock() = State::default();
+}
+
+#[test]
+fn cached_basemap_tiles_are_painted_with_the_attribution() {
+    let _page = super::page_test_lock();
+    let (mut app, a, _) = demo();
+    with_review_state(vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let size = vec2(520.0, 780.0);
+    let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, 0.0, vec![]), |ui| page(&mut app, ui));
+    // the national view at 520 pt asks for z4; seed the tile under Beijing as if it had arrived
+    let (wx, wy) = crate::tiles::world_xy_gcj(39.9, 116.4);
+    let n = 1u32 << 4;
+    let key = crate::tiles::TileKey { z: 4, x: (wx * n as f64) as u32, y: (wy * n as f64) as u32 };
+    crate::tiles::insert_for_test(&view.ctx, key, 2);
+    let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, 0.1, vec![]), |ui| page(&mut app, ui));
+    let textured =
+        view.painted_shapes().iter().any(|shape| matches!(shape, egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default()));
+    assert!(textured, "a cached basemap tile is painted as a texture");
+    let text = view.painted_text().join("\n");
+    assert!(text.contains("高德"), "the AMap attribution is painted: {text}");
+    assert!(!text.contains("The boundaries are schematic."), "the schematic note gives way to the basemap: {text}");
     *lock() = State::default();
 }
 

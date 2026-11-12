@@ -1,7 +1,7 @@
 //! What the extension pages share: the photo scope (selected / current view / entire library),
 //! its enumeration and its counts, and the segmented scope control both pages draw.
 
-use egui::{RichText, Ui};
+use egui::Ui;
 use lightcraft_catalog::PhotoId;
 use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::widgets;
@@ -77,23 +77,63 @@ pub fn count_of(scope: Scope, counts: (usize, usize, usize)) -> usize {
     }
 }
 
-/// The segmented scope control (§10 范围): three segments with their live counts. Returns the
-/// scope that was clicked, if any.
+/// The segmented scope control (§10 范围): three equal segments with their live counts, the name
+/// on top and the count below. Returns the scope that was clicked, if any.
 pub fn selector(ui: &mut Ui, scope: Scope, counts: (usize, usize, usize)) -> Option<Scope> {
     let t = Tokens::get(ui.ctx());
+    let width = ui.available_width();
+    let height = 40.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 5.0, t.field);
+    p.rect_stroke(rect, 5.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
+    let seg_w = (width / 3.0).max(1.0);
     let mut clicked = None;
-    ui.horizontal(|ui| {
-        for (option, name, label) in Scope::ALL {
-            let on = scope == option;
-            let text = RichText::new(format!("{}\n{}", i18n::tr(label), trn("{n} photos", &[("n", count_of(option, counts).to_string())])))
-                .font(t.font(10.5))
-                .color(if on { t.text } else { t.text_dim });
-            let response = ui.selectable_label(on, text);
-            widgets::register(ui, format!("ext-scope:{name}"), response.rect);
-            if response.clicked() {
-                clicked = Some(option);
-            }
+    for (index, (option, name, label)) in Scope::ALL.into_iter().enumerate() {
+        let left = rect.left() + seg_w * index as f32;
+        let seg = egui::Rect::from_min_size(egui::pos2(left, rect.top()), egui::vec2(seg_w, height));
+        if index > 0 {
+            p.line_segment(
+                [egui::pos2(seg.left(), rect.top() + 6.0), egui::pos2(seg.left(), rect.bottom() - 6.0)],
+                egui::Stroke::new(1.0, t.field_border),
+            );
         }
-    });
+        let response = ui.interact(seg, ui.scope_id().with(("ext-scope", name)), egui::Sense::click());
+        let on = scope == option;
+        if on {
+            p.rect_filled(seg.shrink(1.0), 4.0, t.pressed);
+            p.rect_stroke(seg.shrink(1.0), 4.0, egui::Stroke::new(1.0, t.button_border), egui::StrokeKind::Inside);
+        } else if response.hovered() {
+            p.rect_filled(seg.shrink(1.0), 4.0, t.hover.gamma_multiply(0.5));
+        }
+        // A narrow panel splits three segments into ~80 pt: the full names do not fit there, so
+        // the segments carry their short form and the full name stays in the screen reader.
+        let short = match option {
+            Scope::Selected => "Selected",
+            Scope::View => "View",
+            Scope::Library => "Library",
+        };
+        p.text(
+            egui::pos2(seg.center().x, seg.top() + 6.0),
+            egui::Align2::CENTER_TOP,
+            i18n::tr(short),
+            t.font(10.5),
+            if on { t.text } else { t.text_dim },
+        );
+        p.text(
+            egui::pos2(seg.center().x, seg.top() + 21.0),
+            egui::Align2::CENTER_TOP,
+            trn("{n} photos", &[("n", count_of(option, counts).to_string())]),
+            t.font(9.5),
+            if on { t.text_label } else { t.text_dim },
+        );
+        widgets::register(ui, format!("ext-scope:{name}"), seg);
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, on, i18n::tr(label)));
+        let activated =
+            response.clicked() || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)));
+        if activated {
+            clicked = Some(option);
+        }
+    }
     clicked
 }
