@@ -229,3 +229,31 @@ evaluates it (`.github/workflows/nix.yml`), so the build may lag behind the work
 - Don't add or change CI in a feature or fix PR. If the existing workflows can't build or test a change, link an existing craft-common-actions issue or PR, or open a new issue, or a PR only for a small fix that is safe for every app and does not increase CI time.
 - `ci.yml` is the Linux gate, on every pull request. `ci-windows.yml` adds a Windows leg (clippy and tests of the crates with `cfg(windows)` code) when a pull request changes the paths it lists; add the `full-ci` label to run it on any other pull request. When you add `cfg(windows)` code in a new file, add the file to its `paths` in a CI PR.
 - Some workflow files here still run their own jobs. Don't add to them. Moving a job into craft-common-actions is its own task, never part of another PR, and the job stays here until a shared workflow runs it.
+
+## Fork workflow (this fork only — not upstream)
+
+This fork (`yokii89/lightcraft`) keeps `main` a read-only mirror of `storytold/lightcraft` and does all work on `my`.
+
+- **Never commit to `main`.** It only fast-forwards to `upstream/main`, which keeps GitHub's "Sync fork" button usable. Once `main` carries local commits the button degrades to "Discard commits" (force-overwrite).
+- **`my` holds every local commit**, rebased onto `upstream/main` regularly. One person pushes to it, so rewriting its history is safe.
+- Remotes: `origin` = this fork, `upstream` = `https://github.com/storytold/lightcraft`.
+
+Sync upstream into local work:
+
+```bash
+git switch my
+git fetch upstream
+git rebase upstream/main
+git push --force-with-lease origin my
+```
+
+Refresh the mirror:
+
+```bash
+git switch main
+git fetch upstream
+git reset --hard upstream/main   # check `git status` first: uncommitted work is lost
+git push origin main             # fast-forward only
+```
+
+Branch feature work from `my` and merge it back into `my`. To submit a pull request upstream, branch from `upstream/main` (or rebase the feature branch onto it) so fork-only commits — including this section — stay out of the PR.
