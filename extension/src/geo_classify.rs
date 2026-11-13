@@ -1,43 +1,54 @@
 //! The Geographic classification feature (level 2 of the extensions hub, design:
-//! `extension/docs/01-扩展两级导航与地理位置分类设计.md`): the photos of a scope are grouped by
-//! where they were taken — country and city, looked up offline from each photo's GPS with the
-//! GeoNames place names — and the place is written as a hierarchical keyword
+//! `extension/docs/01-扩展两级导航与地理位置分类设计.md`, persistence and auto-sync:
+//! `extension/docs/05-地图相册持久化与自动增量设计.md`): the library's photos are grouped on the
+//! map album by where they were taken — country and city, looked up offline from each photo's GPS
+//! with the GeoNames place names — and the place is written as a hierarchical keyword
 //! `{parent}|{country}|{city}`, one undo step for the whole batch.
+//!
+//! The album is persistent and bound to the library (`<library>/geo-classify.json`, see
+//! [`store`]): photos with GPS join it automatically and incrementally — the sync diffs the
+//! catalog each frame within a small budget, so no user action adds a photo, and reopening the
+//! page shows the album as it was. Writing the keywords stays a reviewed action: the pending
+//! places (the album entries whose photo still lacks the current path keyword) are confirmed on
+//! the review page, where groups can be unticked, before one `Op::Batch` commits.
 //!
 //! The lookup uses [`lightcraft_geocode`] directly, the same public crate the native
 //! `metadata.reverseGeocode` command is built on, for three reasons: that command's enabled check
-//! wants a selection (the Entire-library scope has none), it writes Location *metadata* — this
-//! feature writes keywords — and its per-place details (Sublocation, nearest city) serve the
+//! wants a selection (the whole-library album has no selection), it writes Location *metadata* —
+//! this feature writes keywords — and its per-place details (Sublocation, nearest city) serve the
 //! metadata fields, not the two-level keyword. The dataset itself (GeoNames cities15000,
 //! CC-BY 4.0, ~3 MB) is downloaded by the native `metadata.downloadPlaceNames` command and shared
 //! with it; the page shows the attribution wherever it shows the dataset.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Align, RichText, Sense, Ui, vec2};
-use lightcraft_catalog::{Meta, Op, PhotoId};
+use lightcraft_catalog::{Aspects, Meta, Op, PhotoId};
 use lightcraft_engine::Session;
 use lightcraft_engine::catalog::keywords;
 use lightcraft_engine::cmd::keywords as keywords_cmd;
 use lightcraft_geocode::{GEONAMES_FILES, GeoNames, LatLon};
+use lightcraft_meta::{Tracklog, parse_gpx};
 use lightcraft_ui_egui::button::Button;
 use lightcraft_ui_egui::icons::{self, Icon};
+use lightcraft_ui_egui::pick::PickRequest;
 use lightcraft_ui_egui::progress::spinner;
 use lightcraft_ui_egui::text_field::TextField;
 use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::{LightcraftApp, i18n};
 use serde_json::Value;
 
-use crate::scope::{self, Scope};
 use crate::ui::{
     Pill, action_bar, action_note, card, card_head, field, hint, path_example, primary_action, split_page, status_pill, success_card, trn, warning,
     with_alpha,
 };
 
 mod map;
+mod store;
 
 /// The feature's id in the hub.
 pub(crate) const PAGE_ID: &str = "geo-classify";
@@ -51,7 +62,37 @@ const PARENT_DEFAULT: &str = "地点";
 
 /// How often the place-names status is fetched again while a download runs (§: the download is a
 /// background task; the page follows it).
-const STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const STATUS_POLL: Duration = Duration::from_millis(500);
+
+/// How long the store save waits after the album changed, so a burst of syncs writes one file.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How often a failed store save tries again (the failure is logged; the album stays in memory).
+const SAVE_RETRY: Duration = Duration::from_secs(5);
+
+/// Photos classified per frame at most: the album fills without holding a frame.
+const SYNC_BUDGET: usize = 400;
+
+/// The wall-clock part of the per-frame sync budget (a pathological reverse lookup cannot eat a
+/// frame).
+const SYNC_BUDGET_TIME: Duration = Duration::from_millis(4);
+
+/// After a failed gazetteer load, the next try waits this long (a present-but-broken dataset must
+/// not be re-parsed every frame).
+const SYNC_RETRY: Duration = Duration::from_secs(2);
+
+/// Selected GPX files are user input; keep both disk reads and route rendering bounded.
+const MAX_TRACK_BYTES: u64 = 64 << 20;
+const MAX_TRACKS: usize = 4;
+const MAX_TRACK_POINTS: usize = 1_000_000;
+const MAX_DRAWN_TRACK_POINTS: usize = 20_000;
+
+/// The map's fixed height in the album card (the review's map fills the panel instead).
+const ALBUM_MAP_H: f32 = 340.0;
+
+/// What the album snapshot must rebuild on: photos added or removed, or their metadata (GPS,
+/// keywords, name) or file changed. Develop edits and ratings do not rebuild it.
+const SNAPSHOT_ASPECTS: Aspects = Aspects::PRESENCE.with(Aspects::META).with(Aspects::FILE);
 
 // ---------------------------------------------------------------- state
 
@@ -103,8 +144,8 @@ pub(crate) struct Group {
     pub places: Vec<PhotoPlace>,
 }
 
-/// The groups of the report, by their keyword path, in stable (path) order. A photo without a
-/// found place is in no group (the review says separately how many had no GPS or no match).
+/// The groups of `places`, by their keyword path, in stable (path) order. A photo without a
+/// found place is in no group.
 pub(crate) fn groups(parent: &str, places: &[PhotoPlace]) -> Vec<Group> {
     let mut by_path: BTreeMap<String, Group> = BTreeMap::new();
     for place in places {
@@ -127,11 +168,29 @@ struct Applied {
     undone: bool,
 }
 
+#[derive(Clone)]
+struct TrackOverlay {
+    path: String,
+    name: String,
+    log: Arc<Tracklog>,
+}
+
+/// The incremental sync of the album: what still needs a lookup, and where the last pass stopped.
+#[derive(Default)]
+struct Sync {
+    /// Photo ids to (re)classify, from the last diff. Rebuilt only once drained, so a change
+    /// mid-processing waits for the current queue instead of dropping it.
+    queue: Vec<PhotoId>,
+    /// How far the budgeted processing has got.
+    cursor: usize,
+    /// The catalog revision the album was last diffed at; `None` wants a full pass.
+    baseline: Option<u64>,
+    /// When the gazetteer may be tried again after a failed load.
+    retry_at: Option<Instant>,
+}
+
 #[derive(Default)]
 struct State {
-    scope: Scope,
-    /// The library count cache for the scope counts (see [`scope::counts`]).
-    lib_count: Option<(u64, usize)>,
     parent: String,
     phase: Phase,
     /// The last `metadata.placeNamesStatus` answer.
@@ -141,28 +200,51 @@ struct State {
     status_at: Option<Instant>,
     /// The parsed gazetteer, kept while its file stands (the native `PlaceNames` cache's shape).
     gazetteer: Option<(PathBuf, u64, Option<SystemTime>, Arc<GeoNames>)>,
-    // the report
-    entries: Vec<(PhotoId, String)>,
+    /// GPX overlays belong to the current library; paths are persisted, parsed data is rebuilt.
+    tracks: Vec<TrackOverlay>,
+    track_pick: Option<Receiver<Vec<String>>>,
+    track_loads: Vec<Receiver<(String, Result<Tracklog, String>)>>,
+    // the album (design 05): the persisted classification, bound to the library
+    store: store::Album,
+    /// The library generation the store was loaded for.
+    loaded_gen: Option<u64>,
+    /// Bumped on every album mutation: part of the snapshot's key.
+    store_gen: u64,
+    /// Whether the album changed since its file was written.
+    store_dirty: bool,
+    /// When the debounced store save runs.
+    save_at: Option<Instant>,
+    /// Photos the sync added to the album since the page opened (the card's 新增).
+    added: usize,
+    /// In-library photos without a usable GPS, from the last full pass.
+    no_gps: usize,
+    // the album snapshot: the places derived from the store and the catalog as they are now
     places: Vec<PhotoPlace>,
-    without_gps: usize,
+    /// The pending places: album photos still lacking the current path keyword (the review).
+    pending: Vec<PhotoPlace>,
+    /// The snapshot's key: (store generation, catalog revision, parent).
+    snapshot: Option<(u64, u64, String)>,
+    /// Photos the lookup found no place for, from the snapshot.
     unmatched: usize,
-    error: Option<String>,
+    // the sync
+    sync: Sync,
     // the review
     groups_off: HashSet<String>,
     /// The map's view and what is selected on it.
     map: map::MapView,
     map_sel: Option<String>,
-    /// The online AMap basemap is switched off (the offline schematic map shows instead).
-    tiles_off: bool,
     /// The photo shown in the detail view from a thumbnail click (for the ring).
     photo_sel: Option<PhotoId>,
+    /// The online AMap basemap is switched off (the offline schematic map shows instead).
+    tiles_off: bool,
     // the outcome
     applied: Option<Applied>,
     apply_error: Option<String>,
+    error: Option<String>,
 }
 
 impl State {
-    /// The included photos: their group is ticked in the map's place card.
+    /// The included places: their group is ticked in the map's place card.
     fn included<'a>(&'a self, all: &'a [Group]) -> impl Iterator<Item = &'a PhotoPlace> {
         all.iter().filter(|g| !self.groups_off.contains(&g.path)).flat_map(|g| g.places.iter())
     }
@@ -224,7 +306,8 @@ fn widgets_page(ui: &mut Ui) {
     lightcraft_ui_egui::widgets::register(ui, format!("page:{PAGE_ID}"), ui.max_rect());
 }
 
-/// The per-frame work: follow a running place-names download by re-reading the status.
+/// The per-frame work: follow a running place-names download by re-reading the status, then run
+/// the album's sync (§05), then the debounced store save.
 fn pump(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
     let due = st.status_at.is_some_and(|at| Instant::now() >= at);
     if due {
@@ -238,6 +321,425 @@ fn pump(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
             st.status = Some(v);
         }
     }
+    pump_album(app, ctx, st);
+    pump_tracks(app, ctx, st);
+    if st.save_at.is_some_and(|at| Instant::now() >= at) {
+        save_store(app, st);
+    }
+}
+
+// ---------------------------------------------------------------- the album sync (design 05)
+
+/// The library's directory, when it is on disk: the store lives there, otherwise the album is
+/// memory-only for this session.
+fn library_dir(app: &LightcraftApp) -> Option<PathBuf> {
+    app.session.library.as_ref().filter(|l| l.on_disk).map(|l| l.dir.clone())
+}
+
+/// The album's per-frame work: reload the store when the library changed, diff the catalog for
+/// new, moved and removed photos once the last queue has drained, and process the queue within a
+/// per-frame budget once the gazetteer is available.
+fn pump_album(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
+    // the album is bound to the library: another library loads its own store (or starts empty)
+    let library_gen = app.session.library_generation();
+    if st.loaded_gen != Some(library_gen) {
+        st.loaded_gen = Some(library_gen);
+        let dir = library_dir(app);
+        match store::path(dir.as_deref()).and_then(|p| store::read(&p)) {
+            Some(album) => {
+                st.parent = album.parent.clone();
+                st.store = album;
+            }
+            None => {
+                st.parent = PARENT_DEFAULT.to_string();
+                st.store = store::Album::default();
+            }
+        }
+        st.store_gen += 1;
+        st.store_dirty = false;
+        st.save_at = None;
+        st.added = 0;
+        let tracks_before = st.store.tracks.len();
+        st.store.tracks.truncate(MAX_TRACKS);
+        if st.store.tracks.len() != tracks_before {
+            st.store_dirty = true;
+            save_soon(st);
+        }
+        st.sync = Sync::default(); // discard work and ids belonging to the previous library
+        st.snapshot = None;
+        st.places.clear();
+        st.pending.clear();
+        st.unmatched = 0;
+        st.no_gps = 0;
+        st.groups_off.clear();
+        st.tracks.clear();
+        st.track_pick = None;
+        st.track_loads.clear();
+        let track_paths: Vec<String> = st.store.tracks.iter().take(MAX_TRACKS).cloned().collect();
+        for path in track_paths {
+            load_track(app, ctx, st, path);
+        }
+        st.phase = Phase::Idle;
+        st.map = map::MapView::default();
+        st.map_sel = None;
+        st.photo_sel = None;
+        st.applied = None;
+        st.apply_error = None;
+        st.error = None;
+    }
+    // the diff runs only once the last queue has drained: a change mid-processing waits, so the
+    // queue is never dropped (the next diff re-derives whatever it held)
+    let revision = app.session.catalog.revision;
+    if st.sync.cursor >= st.sync.queue.len() && st.sync.baseline != Some(revision) {
+        sync_diff(app, st);
+        st.sync.baseline = Some(revision);
+        if st.store_dirty && st.sync.queue.is_empty() {
+            save_soon(st);
+        }
+    }
+    // the queue: lookups within the budget, once the place names are on disk (the dataset card
+    // offers the download while they are not)
+    let present = place_names_present();
+    if st.sync.cursor < st.sync.queue.len() && present && st.sync.retry_at.is_none_or(|at| Instant::now() >= at) {
+        match gazetteer(st) {
+            Ok(names) => {
+                st.sync.retry_at = None;
+                sync_process(app, st, &names);
+            }
+            Err(e) => {
+                if st.sync.retry_at.is_none_or(|at| Instant::now() >= at) {
+                    st.sync.retry_at = Some(Instant::now() + SYNC_RETRY);
+                    st.error = Some(e);
+                }
+            }
+        }
+    }
+    // keep the frames coming while the sync works or a save is due
+    if st.sync.cursor < st.sync.queue.len() && present {
+        if let Some(at) = st.sync.retry_at {
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+        } else {
+            ctx.request_repaint();
+        }
+    } else if let Some(at) = st.save_at {
+        ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// Ask the host for a GPX file without blocking the map's UI thread.
+fn pick_track(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
+    if st.track_pick.is_some() || st.store.tracks.len() >= MAX_TRACKS {
+        return;
+    }
+    let request = PickRequest::file(i18n::tr("Add GPX track"), i18n::tr("GPS Track Log"), &["gpx"]);
+    if let Some(picker) = app.services.picker.as_mut() {
+        match picker(request) {
+            Ok(rx) => st.track_pick = Some(rx),
+            Err(e) => st.error = Some(e),
+        }
+    } else if let Some(paths) = app.services.pick_tracklog.as_mut().map(|pick| pick())
+        && let Some(path) = paths.into_iter().next()
+    {
+        add_track(app, ctx, st, path);
+    }
+}
+
+fn add_track(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State, path: String) {
+    if st.store.tracks.len() >= MAX_TRACKS || st.store.tracks.iter().any(|known| known == &path) {
+        return;
+    }
+    st.store.tracks.push(path.clone());
+    st.store_dirty = true;
+    save_soon(st);
+    load_track(app, ctx, st, path);
+}
+
+fn load_track(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State, path: String) {
+    let (tx, rx) = channel();
+    let repaint = ctx.clone();
+    let guard = app.session.activity.start("geoTracklog", "Loading GPX track", lightcraft_engine::activity::Cancel::No);
+    let worker_path = path.clone();
+    let result_path = path.clone();
+    let worker = std::thread::Builder::new().name("lightcraft-gpx".to_string()).spawn(move || {
+        let result = (|| {
+            let file = std::fs::File::open(&worker_path).map_err(|e| format!("{}: {e}", worker_path))?;
+            let meta = file.metadata().map_err(|e| format!("{}: {e}", worker_path))?;
+            if !meta.is_file() || meta.len() > MAX_TRACK_BYTES {
+                return Err(format!("{}: GPX file exceeds the 64 MiB limit or is not a regular file", worker_path));
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.take(MAX_TRACK_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", worker_path))?;
+            if bytes.len() as u64 > MAX_TRACK_BYTES {
+                return Err(format!("{}: GPX file exceeds the 64 MiB limit", worker_path));
+            }
+            let text = String::from_utf8(bytes).map_err(|e| format!("{}: GPX must be UTF-8: {e}", worker_path))?;
+            let log = parse_gpx(&text).map_err(|e| format!("{}: {e}", worker_path))?;
+            if log.points.is_empty() {
+                return Err(format!("{}: the track has no timed points", worker_path));
+            }
+            if log.points.len() > MAX_TRACK_POINTS {
+                return Err(format!("{}: the track exceeds the 1,000,000 point limit", worker_path));
+            }
+            Ok(log)
+        })();
+        let _ = tx.send((result_path, result));
+        drop(guard);
+        repaint.request_repaint();
+    });
+    match worker {
+        Ok(_) => st.track_loads.push(rx),
+        Err(e) => {
+            st.store.tracks.retain(|stored| stored != &path);
+            st.store_dirty = true;
+            save_soon(st);
+            st.error = Some(format!("GPX loader could not start: {e}"));
+        }
+    }
+}
+
+fn pump_tracks(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
+    if let Some(rx) = st.track_pick.as_ref() {
+        match rx.try_recv() {
+            Ok(paths) => {
+                st.track_pick = None;
+                if let Some(path) = paths.into_iter().next() {
+                    add_track(app, ctx, st, path);
+                }
+            }
+            Err(TryRecvError::Disconnected) => st.track_pick = None,
+            Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(250)),
+        }
+    }
+    let mut waiting = Vec::new();
+    for rx in std::mem::take(&mut st.track_loads) {
+        match rx.try_recv() {
+            Ok((path, Ok(log))) => {
+                if !st.tracks.iter().any(|t| t.path == path) {
+                    let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("GPX track").to_string();
+                    st.tracks.push(TrackOverlay { path, name, log: Arc::new(log) });
+                }
+            }
+            Ok((path, Err(e))) => {
+                st.store.tracks.retain(|stored| stored != &path);
+                st.store_dirty = true;
+                save_soon(st);
+                st.error = Some(e);
+            }
+            Err(TryRecvError::Empty) => waiting.push(rx),
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+    st.track_loads = waiting;
+    if !st.track_loads.is_empty() {
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+/// Rebuild the queue: prune the album of photos that left the library or lost their GPS, and queue
+/// every photo that is new to the album or moved since its classification. The first pass (no
+/// baseline) walks the whole library; later passes only the photos the catalog reports touched
+/// since it — falling back to the whole library when that history is no longer remembered. The
+/// caller records the catalog revision the pass ran at.
+fn sync_diff(app: &LightcraftApp, st: &mut State) {
+    st.sync.queue.clear();
+    st.sync.cursor = 0;
+    let touched = st.sync.baseline.and_then(|rev| app.session.catalog.touched_since(rev));
+    match touched {
+        Some(ids) => {
+            for id in ids {
+                sync_photo(app, st, id);
+            }
+        }
+        None => {
+            // the whole library: prune the album first, then queue what is missing or moved
+            let mut gone = Vec::new();
+            for (&id, _) in st.store.photos.iter() {
+                let keep = match app.session.catalog.photo(PhotoId(id)) {
+                    None => false,
+                    Some(p) => p.in_library() && !p.is_video() && p.meta.gps.is_some_and(|(lat, lon)| LatLon::new(lat, lon).is_valid()),
+                };
+                if !keep {
+                    gone.push(id);
+                }
+            }
+            for id in gone {
+                st.store_dirty |= st.store.remove(PhotoId(id));
+            }
+            let mut no_gps = 0usize;
+            for p in app.session.catalog.photos() {
+                if !p.in_library() || p.is_video() {
+                    continue;
+                }
+                let Some((lat, lon)) = p.meta.gps else {
+                    no_gps += 1;
+                    continue;
+                };
+                if !LatLon::new(lat, lon).is_valid() {
+                    no_gps += 1;
+                    continue;
+                }
+                let id = p.id;
+                if !st.store.entry(id).is_some_and(|e| e.at_basis(lat, lon)) {
+                    st.sync.queue.push(id);
+                }
+            }
+            st.no_gps = no_gps;
+        }
+    }
+}
+
+/// One touched photo: prune its album entry when it left the library or lost its GPS, queue it
+/// when it is new to the album or moved since its classification, and leave an entry that still
+/// classifies the photo's current GPS alone.
+fn sync_photo(app: &LightcraftApp, st: &mut State, id: PhotoId) {
+    let Some(p) = app.session.catalog.photo(id) else {
+        st.store_dirty |= st.store.remove(id);
+        return;
+    };
+    if !p.in_library() || p.is_video() {
+        st.store_dirty |= st.store.remove(id);
+        return;
+    }
+    let Some((lat, lon)) = p.meta.gps else {
+        st.store_dirty |= st.store.remove(id);
+        return;
+    };
+    if !LatLon::new(lat, lon).is_valid() {
+        // an unusable position: not stored, so nothing re-queues for it
+        st.store_dirty |= st.store.remove(id);
+        return;
+    }
+    if !st.store.entry(id).is_some_and(|e| e.at_basis(lat, lon)) {
+        st.sync.queue.push(id);
+    }
+}
+
+/// Classify up to [`SYNC_BUDGET`] queued photos against `names`, writing the album. An unmatched
+/// photo records a bare entry so later passes skip it instead of re-looking it up.
+fn sync_process(app: &LightcraftApp, st: &mut State, names: &GeoNames) {
+    let deadline = Instant::now() + SYNC_BUDGET_TIME;
+    let mut done = 0usize;
+    while st.sync.cursor < st.sync.queue.len() && done < SYNC_BUDGET && Instant::now() < deadline {
+        let id = st.sync.queue[st.sync.cursor];
+        st.sync.cursor += 1;
+        done += 1;
+        let Some(p) = app.session.catalog.photo(id) else { continue };
+        let Some((lat, lon)) = p.meta.gps else { continue }; // gone mid-queue: the next diff prunes
+        let at = LatLon::new(lat, lon);
+        if !at.is_valid() {
+            continue;
+        }
+        let entry = match names.reverse(at) {
+            Some(place) => store::Entry { id: id.0, country: place.country, city: place.city, iso: place.iso, distance: place.distance, lat, lon },
+            None => store::Entry { id: id.0, lat, lon, ..store::Entry::default() },
+        };
+        let fresh = st.store.entry(id).is_none();
+        if st.store.entry(id) != Some(&entry) {
+            st.store.insert(entry);
+            st.store_dirty = true;
+            st.store_gen += 1;
+            if fresh {
+                st.added += 1;
+            }
+        }
+    }
+    if st.sync.cursor >= st.sync.queue.len() {
+        st.sync.queue.clear();
+        st.sync.cursor = 0;
+        if st.store_dirty {
+            save_soon(st);
+        }
+    }
+}
+
+/// The album snapshot ([`State::places`] and [`State::pending`], and the unmatched count): rebuilt
+/// when the store, the parent, or the catalog's photo-relevant state changed — develop edits and
+/// ratings do not rebuild it. Entries record the GPS the classification was computed from; the
+/// places draw the photo's current GPS, so a moved photo shows at its new spot until the sync
+/// re-classifies it.
+fn sync_snapshot(app: &LightcraftApp, st: &mut State) {
+    let key_gen = st.store_gen;
+    let revision = app.session.catalog.revision;
+    if let Some((s_gen, s_rev, s_parent)) = st.snapshot.clone()
+        && s_gen == key_gen
+        && s_parent == st.parent
+    {
+        if s_rev == revision {
+            return;
+        }
+        if let Some(a) = app.session.catalog.aspects_since(s_rev)
+            && !a.any_of(SNAPSHOT_ASPECTS)
+        {
+            st.snapshot = Some((key_gen, revision, st.parent.clone()));
+            return;
+        }
+    }
+    let mut places = Vec::new();
+    let mut pending = Vec::new();
+    let mut unmatched = 0usize;
+    for entry in st.store.photos.values() {
+        if entry.unmatched() {
+            unmatched += 1;
+            continue;
+        }
+        let id = PhotoId(entry.id);
+        let Some(p) = app.session.catalog.photo(id) else { continue };
+        if !p.in_library() || p.is_video() {
+            continue;
+        }
+        let Some((lat, lon)) = p.meta.gps else { continue };
+        let place = PhotoPlace {
+            id,
+            name: p.file_name.clone(),
+            country: entry.country.clone(),
+            city: entry.city.clone(),
+            iso: entry.iso.clone(),
+            lat,
+            lon,
+            distance: entry.distance,
+        };
+        let path = place.path(&st.parent);
+        let written = !path.is_empty() && p.meta.keywords.iter().any(|k| keywords::same(k, &path));
+        if !written {
+            pending.push(place.clone());
+        }
+        places.push(place);
+    }
+    st.places = places;
+    st.pending = pending;
+    st.unmatched = unmatched;
+    st.snapshot = Some((key_gen, revision, st.parent.clone()));
+}
+
+/// The store file's save: debounced; a failure is logged and retried, never a toast (the sync
+/// saves by itself, so an unreadable library directory must not nag every few seconds). Without a
+/// library on disk there is nothing to write — the album lives in memory.
+fn save_store(app: &LightcraftApp, st: &mut State) {
+    st.save_at = None;
+    if !st.store_dirty {
+        return;
+    }
+    let dir = library_dir(app);
+    let Some(path) = store::path(dir.as_deref()) else { return };
+    match store::write(&path, &st.store) {
+        Ok(()) => st.store_dirty = false,
+        Err(e) => {
+            log::warn!("geo classify: the album was not saved: {e}");
+            st.save_at = Some(Instant::now() + SAVE_RETRY);
+        }
+    }
+}
+
+/// Save the store file on the next frame.
+fn save_soon(st: &mut State) {
+    st.save_at = Some(Instant::now() + SAVE_DEBOUNCE);
+}
+
+/// Whether the place-names dataset is on disk (the sync waits for it silently; the dataset card
+/// offers the download).
+fn place_names_present() -> bool {
+    lightcraft_engine::config::config_dir().is_some_and(|d| std::fs::metadata(d.join("geonames").join(GEONAMES_FILES[0])).is_ok())
 }
 
 // ---------------------------------------------------------------- the dataset
@@ -287,61 +789,7 @@ fn gazetteer(st: &mut State) -> Result<Arc<GeoNames>, String> {
         .map_err(|e| format!("{}: {e}", i18n::tr("The place names could not be read.")))
 }
 
-// ---------------------------------------------------------------- the classification
-
-/// Look up every photo of the scope that carries a GPS position and build the review (§: the
-/// lookup is offline, from the shared dataset; nothing is written here).
-fn run_review(app: &mut LightcraftApp, st: &mut State) {
-    st.error = None;
-    st.apply_error = None;
-    let (entries, _skipped) = scope::enumerate(app, st.scope, false);
-    let names = match gazetteer(st) {
-        Ok(names) => names,
-        Err(e) => {
-            st.error = Some(e);
-            return;
-        }
-    };
-    let mut places = Vec::new();
-    let mut without_gps = 0usize;
-    let mut unmatched = 0usize;
-    for (id, name) in &entries {
-        let Some(p) = app.session.catalog.photo(*id) else { continue };
-        let Some((lat, lon)) = p.meta.gps else {
-            without_gps += 1;
-            continue;
-        };
-        let at = LatLon::new(lat, lon);
-        if !at.is_valid() {
-            unmatched += 1;
-            continue;
-        }
-        match names.reverse(at) {
-            Some(place) => places.push(PhotoPlace {
-                id: *id,
-                name: name.clone(),
-                country: place.country,
-                city: place.city,
-                iso: place.iso,
-                lat,
-                lon,
-                distance: place.distance,
-            }),
-            None => unmatched += 1,
-        }
-    }
-    st.entries = entries;
-    st.places = places;
-    st.without_gps = without_gps;
-    st.unmatched = unmatched;
-    st.groups_off.clear();
-    st.map = map::MapView::default();
-    st.map_sel = None;
-    st.photo_sel = None;
-    st.applied = None;
-    st.apply_error = None;
-    st.phase = Phase::Review;
-}
+// ---------------------------------------------------------------- the write
 
 /// Write the kept groups as one `Op::Batch` of `SetMeta`s — one undo step. Only photos with at
 /// least one new keyword change; nothing is committed when none do.
@@ -382,9 +830,20 @@ fn apply(app: &mut LightcraftApp, st: &State, all: &[Group]) -> Result<(usize, u
     Ok((photos, count))
 }
 
+/// Open the review of what the album would write now (the pending places).
+fn enter_review(st: &mut State) {
+    st.phase = Phase::Review;
+    st.map = map::MapView::default();
+    st.map_sel = None;
+    st.photo_sel = None;
+    st.applied = None;
+    st.apply_error = None;
+    // groups unticked on the album map stay unticked in the review
+}
+
 /// Write what the review keeps (Review → Done).
 fn write_review(app: &mut LightcraftApp, st: &mut State) {
-    let all = groups(&st.parent, &st.places);
+    let all = groups(&st.parent, &st.pending);
     st.phase = Phase::Applying;
     match apply(app, st, &all) {
         Ok((photos, count)) => {
@@ -412,13 +871,10 @@ fn undo_batch(app: &mut LightcraftApp, st: &mut State) {
     }
 }
 
-/// Back to the settings (Discard all / Classify again), keeping the dataset cache.
+/// Back to the album (Discard all / 返回相册). The album and its store stay; only the review's
+/// run state clears.
 fn back_to_idle(st: &mut State) {
     st.phase = Phase::Idle;
-    st.places.clear();
-    st.entries.clear();
-    st.without_gps = 0;
-    st.unmatched = 0;
     st.groups_off.clear();
     st.map = map::MapView::default();
     st.map_sel = None;
@@ -431,6 +887,7 @@ fn back_to_idle(st: &mut State) {
 // ---------------------------------------------------------------- drawing
 
 fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    sync_snapshot(app, st);
     let footer_h = match st.phase {
         Phase::Idle => 66.0,
         Phase::Review => 62.0,
@@ -465,24 +922,25 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar));
     action_bar(&mut bar_ui, |ui| match st.phase {
         Phase::Idle => {
-            let (selected, view, library) = scope::counts(app, &mut st.lib_count);
-            let in_scope = scope::count_of(st.scope, (selected, view, library));
-            let ready = dataset_ready(st.status.as_ref());
-            let label = trn("Classify ({n} photos)", &[("n", in_scope.to_string())]);
-            if primary_action(ui, &label, ready && in_scope > 0, "geo:start") {
-                run_review(app, st);
+            let label = trn("Write keywords ({n} photos)", &[("n", st.pending.len().to_string())]);
+            if primary_action(ui, &label, !st.pending.is_empty(), "geo:start") {
+                enter_review(st);
             }
-            let note = if !ready { i18n::tr("Download the place names once.") } else { i18n::tr("One undo step reverts the whole batch.") };
+            let note = if dataset_ready(st.status.as_ref()) {
+                i18n::tr("New photos join the album automatically; confirm each place before writing.")
+            } else {
+                i18n::tr("Download the place names once.")
+            };
             action_note(ui, note);
         }
         Phase::Review => {
-            let all = groups(&st.parent, &st.places);
+            let all = groups(&st.parent, &st.pending);
             let (photos, _) = st.review_counts(&all);
             let label = trn("Write to {n} photos", &[("n", photos.to_string())]);
             if primary_action(ui, &label, photos > 0, "geo:write") {
                 write_review(app, st);
             }
-            let out = st.without_gps.saturating_add(st.unmatched);
+            let out = st.no_gps.saturating_add(st.unmatched);
             let note = if out > 0 {
                 trn("Not written: {n} photos", &[("n", out.to_string())])
             } else {
@@ -494,10 +952,9 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     });
 }
 
-/// The idle page: the dataset card, the scope, the parent keyword. The one main action lives in
-/// the sticky footer.
+/// The idle page is the album's home: the dataset card, the album card (the map of everything
+/// already in the album, with the sync's progress), the parent keyword.
 fn draw_idle(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let (selected, view, library) = scope::counts(app, &mut st.lib_count);
     let status = st.status.clone();
     let downloading = status.as_ref().and_then(|v| v.get("downloading")).and_then(Value::as_bool).unwrap_or(false);
     let ready = dataset_ready(status.as_ref());
@@ -560,20 +1017,19 @@ fn draw_idle(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
         let attribution = status.as_ref().and_then(|v| v.get("attribution")).and_then(Value::as_str).unwrap_or("GeoNames · CC-BY 4.0");
         hint(ui, attribution);
     });
-    card(ui, |ui| {
-        card_head(ui, Icon::GridSquare, "Scope", |_| {});
-        if let Some(scope) = scope::selector(ui, st.scope, (selected, view, library)) {
-            st.scope = scope;
-        }
-        ui.add_space(6.0);
-        hint(ui, i18n::tr("Only photos with a GPS position are classified."));
-    });
+    draw_album_card(app, ui, st);
     card(ui, |ui| {
         card_head(ui, Icon::Tag, "Keywords", |_| {});
         field(ui, "Parent keyword", |ui| {
             let resp = TextField::singleline("geo:parent", &mut st.parent).hint(PARENT_DEFAULT).width(120.0).show(ui);
             if resp.response.changed() || resp.committed() {
                 st.parent = keywords::clean(&st.parent);
+                // the album remembers the parent between sessions (§05)
+                st.store.parent = st.parent.clone();
+                st.store_dirty = true;
+                st.store_gen += 1;
+                st.groups_off.clear();
+                save_soon(st);
             }
         });
         let parent = if st.parent.trim().is_empty() { i18n::tr("Country").to_string() } else { st.parent.trim().to_string() };
@@ -582,7 +1038,116 @@ fn draw_idle(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     });
 }
 
-/// The review: the summary card, then the map as the main view. The write sits in the sticky
+/// The album card: the map of everything the album holds (the photos the sync has classified),
+/// with the sync's progress and the counts the write would cover.
+fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let syncing = st.sync.cursor < st.sync.queue.len();
+    let queued = st.sync.queue.len() - st.sync.cursor.min(st.sync.queue.len());
+    let pill = if syncing {
+        i18n::tr("Syncing…").to_string()
+    } else if st.places.is_empty() {
+        i18n::tr("Empty").to_string()
+    } else {
+        trn("{n} photos", &[("n", st.places.len().to_string())])
+    };
+    let kind = if syncing {
+        Pill::Busy
+    } else if st.places.is_empty() {
+        Pill::Idle
+    } else {
+        Pill::Ready
+    };
+    let tracks = st.tracks.clone();
+    card(ui, |ui| {
+        card_head(ui, Icon::Album, "Map album", |ui| status_pill(ui, &pill, kind));
+        draw_tracks_row(app, ui, st);
+        if st.places.is_empty() && tracks.is_empty() {
+            let line = if place_names_present() {
+                i18n::tr("Photos with a GPS position join the album automatically.")
+            } else {
+                i18n::tr("Download the place names, and photos with a GPS position join the album automatically.")
+            };
+            ui.add_space(2.0);
+            hint(ui, line);
+        } else {
+            let all = groups(&st.parent, &st.places);
+            map::draw_map(app, ui, st, &all, &tracks, Some(ALBUM_MAP_H));
+        }
+        ui.add_space(6.0);
+        let mut line = trn("{n} in the album", &[("n", st.places.len().to_string())]);
+        if !st.pending.is_empty() {
+            line.push_str(" · ");
+            line.push_str(&trn("{n} to write", &[("n", st.pending.len().to_string())]));
+        }
+        if st.unmatched > 0 {
+            line.push_str(" · ");
+            line.push_str(&trn("{n} without a place", &[("n", st.unmatched.to_string())]));
+        }
+        if st.no_gps > 0 {
+            line.push_str(" · ");
+            line.push_str(&trn("{n} without GPS", &[("n", st.no_gps.to_string())]));
+        }
+        hint(ui, &line);
+        if syncing {
+            ui.add_space(2.0);
+            hint(ui, &trn("Adding {n} photos…", &[("n", queued.to_string())]));
+        } else if st.added > 0 {
+            ui.add_space(2.0);
+            hint(ui, &trn("Added {n} photos automatically this session.", &[("n", st.added.to_string())]));
+        }
+    });
+}
+
+fn draw_tracks_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let ctx = ui.ctx().clone();
+    let selected = app.session.selection.ids.len();
+    ui.horizontal(|ui| {
+        if Button::new(i18n::tr("Add GPX track"))
+            .secondary()
+            .small()
+            .enabled(app.services.picker.is_some() || app.services.pick_tracklog.is_some())
+            .widget("geo:track:add")
+            .show(ui)
+            .clicked()
+        {
+            pick_track(app, &ctx, st);
+        }
+        ui.label(trn("{n} selected", &[("n", selected.to_string())]));
+    });
+    for (index, track) in st.tracks.clone().into_iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(trn("{name} · {n} points", &[("name", track.name.clone()), ("n", track.log.points.len().to_string())]));
+            if Button::icon_only(Icon::Target, "Focus on GPX track").ghost().small().widget(format!("geo:track:focus:{index}")).show(ui).clicked()
+                && let Some(view) = map::fit_track(&track.log)
+            {
+                st.map = view;
+            }
+            if Button::new(i18n::tr("Match selected photos"))
+                .secondary()
+                .small()
+                .enabled(selected > 0)
+                .widget(format!("geo:track:match:{index}"))
+                .show(ui)
+                .clicked()
+            {
+                let ids: Vec<u64> = app.session.selection.ids.iter().map(|id| id.0).collect();
+                if let Err(e) = app.run("photo.tagFromTracklog", serde_json::json!({ "path": track.path, "ids": ids })) {
+                    st.error = Some(e);
+                }
+            }
+            if Button::icon_only(Icon::Close, "Remove GPX track").ghost().small().widget(format!("geo:track:remove:{index}")).show(ui).clicked() {
+                st.tracks.retain(|loaded| loaded.path != track.path);
+                st.store.tracks.retain(|path| path != &track.path);
+                st.store_dirty = true;
+                st.store_gen += 1;
+                st.snapshot = None;
+                save_soon(st);
+            }
+        });
+    }
+}
+
+/// The review: the summary card, then the map of the pending places. The write sits in the sticky
 /// footer.
 fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let t = Tokens::get(ui.ctx());
@@ -590,7 +1155,8 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
         warning(ui, &trn("The write failed: {e}", &[("e", e)]));
         ui.add_space(4.0);
     }
-    let all = groups(&st.parent, &st.places);
+    let all = groups(&st.parent, &st.pending);
+    let tracks = st.tracks.clone();
     let (photos, count) = st.review_counts(&all);
     let abroad: usize = all.iter().filter(|g| !g.iso.eq_ignore_ascii_case("CN")).map(|g| g.places.len()).sum();
     card(ui, |ui| {
@@ -618,28 +1184,28 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             ui,
             &trn(
                 "Outside China: {n} photos · no match: {m} · no GPS: {k} — not shown, not written",
-                &[("n", abroad.to_string()), ("m", st.unmatched.to_string()), ("k", st.without_gps.to_string())],
+                &[("n", abroad.to_string()), ("m", st.unmatched.to_string()), ("k", st.no_gps.to_string())],
             ),
         );
     });
-    map::draw_map(app, ui, st, &all);
+    map::draw_map(app, ui, st, &all, &tracks, None);
     ui.add_space(6.0);
     hint(ui, i18n::tr("Bubble size = photo count · scroll to zoom, drag to pan · zoom in for photo thumbnails"));
 }
 
-/// The done page: what was written, the undo, another round.
+/// The done page: what was written, the undo, back to the album.
 fn draw_done(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let Some(a) = st.applied.as_ref().map(|a| (a.photos, a.keywords, a.undone)) else { return };
     let (photos, count, undone) = a;
     let title = trn("Wrote {n} photos", &[("n", photos.to_string())]);
     let body = if count == 0 {
-        i18n::tr("Everything the model found was already on the photos.").to_string()
+        i18n::tr("Everything the album held was already on the photos.").to_string()
     } else if undone {
         i18n::tr("The batch was undone.").to_string()
     } else {
         String::new()
     };
-    let out = st.without_gps.saturating_add(st.unmatched);
+    let out = st.no_gps.saturating_add(st.unmatched);
     let stats = [(i18n::tr("Photos"), photos.to_string()), (i18n::tr("Keywords"), count.to_string()), (i18n::tr("Not written"), out.to_string())];
     success_card(ui, &title, &body, &stats);
     card(ui, |ui| {
@@ -648,7 +1214,7 @@ fn draw_done(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             if Button::new(i18n::tr("Undo this batch")).secondary().small().enabled(undo_ok).widget("geo:undo").show(ui).clicked() {
                 undo_batch(app, st);
             }
-            if Button::new(i18n::tr("Classify more")).secondary().small().widget("geo:more").show(ui).clicked() {
+            if Button::new(i18n::tr("Back to the album")).secondary().small().widget("geo:more").show(ui).clicked() {
                 back_to_idle(st);
             }
         });

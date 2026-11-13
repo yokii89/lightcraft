@@ -3823,6 +3823,7 @@ dependencies = [
  "lightcraft-codecs",
  "lightcraft-engine",
  "lightcraft-geocode",
+ "lightcraft-meta",
  "lightcraft-raster",
  "lightcraft-scenes",
  "lightcraft-testkit",

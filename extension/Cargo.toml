@@ -16,6 +16,7 @@ lightcraft-engine = { workspace = true }
 lightcraft-catalog = { workspace = true }
 lightcraft-codecs = { workspace = true }
 lightcraft-geocode = { workspace = true }
+lightcraft-meta = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }

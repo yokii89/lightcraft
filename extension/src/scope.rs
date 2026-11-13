@@ -49,26 +49,7 @@ pub fn enumerate(app: &mut LightcraftApp, scope: Scope, skip_tagged: bool) -> (V
     (entries, skipped)
 }
 
-/// The photos in each scope right now: selected, current view, entire library (videos included —
-/// the numbers are what the user sees in the sidebar). The library count is cached per catalog
-/// revision behind `cache`, which belongs to the calling page's state: a big library is not
-/// walked every frame.
-pub fn counts(app: &mut LightcraftApp, cache: &mut Option<(u64, usize)>) -> (usize, usize, usize) {
-    let selected = app.session.selected().len();
-    let view = app.session.visible().len();
-    let revision = app.session.catalog.revision;
-    let library = match cache {
-        Some((rev, n)) if *rev == revision => *n,
-        _ => {
-            let n = app.session.catalog.photos().filter(|p| p.in_library()).count();
-            *cache = Some((revision, n));
-            n
-        }
-    };
-    (selected, view, library)
-}
-
-/// The number the scope's segment shows for `scope`, from [`counts`]'s three numbers.
+/// The number the scope's segment shows for `scope`, from the page's three numbers.
 pub fn count_of(scope: Scope, counts: (usize, usize, usize)) -> usize {
     match scope {
         Scope::Selected => counts.0,

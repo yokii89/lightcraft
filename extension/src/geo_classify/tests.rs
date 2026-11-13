@@ -1,17 +1,20 @@
 //! Tests of the Geographic classification feature: the keyword paths a place writes, the
 //! grouping, the write with its undo (on the demo library, with synthetic lookup results), the
-//! map's geometry and points, and headless renders/interactions of the review page.
+//! persistent album's store and its incremental sync (design 05), the map's geometry and points,
+//! and headless renders/interactions of the album and review pages.
 
 use egui::vec2;
 use lightcraft_catalog::{Meta, Op, PhotoId};
 use lightcraft_engine::Session;
+use lightcraft_geocode::GeoNames;
 use lightcraft_ui_egui::{LightcraftApp, Services};
 use serde_json::Value;
 use std::time::Instant;
 
 use super::map::{self, MapView, NATIONAL};
-use super::{Applied, PhotoPlace, State};
-use super::{apply, back_to_idle, groups, lock, page};
+use super::store;
+use super::{Applied, PhotoPlace, State, TrackOverlay};
+use super::{apply, back_to_idle, groups, lock, page, sync_diff, sync_process, sync_snapshot, write_review};
 
 fn place(id: u64, name: &str, country: &str, city: &str) -> PhotoPlace {
     place_at(id, name, country, city, "XX", 0.0, 0.0)
@@ -35,52 +38,187 @@ fn place_at(id: u64, name: &str, country: &str, city: &str, iso: &str, lat: f64,
 
 #[test]
 fn a_place_writes_parent_country_city() {
-    let parent = "地点";
-    assert_eq!(place(1, "a.jpg", "中国", "杭州").path(parent), "地点|中国|杭州");
-    // an empty parent drops its level instead of writing an empty one
-    assert_eq!(place(1, "a.jpg", "中国", "杭州").path(""), "中国|杭州");
-    // every level is trimmed and empties are dropped
-    assert_eq!(place(1, "a.jpg", " 中国 ", " 杭州 ").path(" 地点 "), "地点|中国|杭州");
+    let p = place(1, "a.jpg", "中国", "杭州");
+    assert_eq!(p.path("地点"), "地点|中国|杭州");
+    assert_eq!(p.path(" 地点 "), "地点|中国|杭州", "the parent is cleaned like any keyword");
+    assert_eq!(p.path(""), "中国|杭州", "an empty parent drops its level");
 }
 
 #[test]
 fn groups_collect_photos_by_their_keyword_path_in_order() {
-    let parent = "地点";
-    let places = vec![
-        place(1, "a.jpg", "中国", "杭州"),
-        place(2, "b.jpg", "中国", "杭州"),
-        place(3, "c.jpg", "中国", "北京"),
-        place(4, "d.jpg", "日本", "东京"),
-    ];
-    let groups = groups(parent, &places);
-    assert_eq!(groups.len(), 3, "three distinct paths");
-    assert_eq!(groups[0].path, "地点|中国|北京");
-    assert_eq!(groups[0].places.len(), 1);
-    assert_eq!(groups[1].path, "地点|中国|杭州");
-    assert_eq!(groups[1].places.iter().map(|p| p.id).collect::<Vec<_>>(), vec![PhotoId(1), PhotoId(2)]);
-    assert_eq!(groups[2].path, "地点|日本|东京");
+    let places = vec![place(1, "a.jpg", "中国", "杭州"), place(2, "b.jpg", "中国", "杭州"), place(3, "c.jpg", "中国", "北京")];
+    let all = groups("地点", &places);
+    assert_eq!(all.len(), 2, "one group per keyword path");
+    // the groups sort by their path's bytes: 北 (U+5317) before 杭 (U+676D)
+    assert_eq!(all[0].path, "地点|中国|北京");
+    assert_eq!(all[0].places.len(), 1);
+    assert_eq!(all[1].path, "地点|中国|杭州");
+    assert_eq!(all[1].places.len(), 2);
+    assert_eq!(all[1].city, "杭州");
+    assert_eq!(all[1].iso, "XX");
 }
 
 #[test]
 fn a_photo_without_a_found_city_classifies_by_country() {
-    // a defensive case: the lookup found a place but named no city
-    let mut p = place(1, "a.jpg", "冰岛", "");
-    assert_eq!(p.path("地点"), "地点|冰岛");
-    let groups = groups("地点", std::slice::from_ref(&p));
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].city, "");
-    assert_eq!(groups[0].country, "冰岛");
-    let _ = &mut p;
+    let p = place_at(1, "a.jpg", "中国", "", "CN", 36.0, 100.0);
+    assert_eq!(p.path("地点"), "地点|中国", "no city: the country level closes the path");
+    let all = groups("地点", &[p]);
+    assert_eq!(all.len(), 1);
+    assert!(all[0].city.is_empty());
+    assert_eq!(all[0].path, "地点|中国");
 }
 
-// ---------------------------------------------------------------- the write
+// ---------------------------------------------------------------- the album's store (design 05)
 
 fn demo() -> (LightcraftApp, PhotoId, PhotoId) {
     let app = LightcraftApp::new(Session::with_demo(), Services::default());
-    let ids: Vec<PhotoId> = app.session.catalog.photos().take(2).map(|p| p.id).collect();
-    let (a, b) = (ids[0], ids[1]);
+    let a = app.session.catalog.photos().next().expect("the demo library holds photos").id;
+    let b = app.session.catalog.photos().nth(1).expect("the demo library holds two photos").id;
     (app, a, b)
 }
+
+/// Give a demo photo a GPS position (the demo photos carry none).
+fn set_gps(app: &mut LightcraftApp, id: PhotoId, lat: f64, lon: f64) {
+    let p = app.session.catalog.photo(id).unwrap();
+    let meta = Meta { gps: Some((lat, lon)), ..p.meta.clone() };
+    app.session.commit("test", Op::SetMeta { id, meta: Box::new(meta) }).unwrap();
+}
+
+/// A synthetic gazetteer: two Chinese cities far enough apart that a photo can match only one.
+/// 格式与 GeoNames 的 cities15000/countryInfo 相同(制表符分列:1 名、4 纬、5 经、8 国家码、10 省码)。
+fn gazetteer() -> GeoNames {
+    let cities = "\t杭州\t\t\t30.25\t120.16\t\t\tCN\t\t02\n\t北京\t\t\t39.90\t116.40\t\t\tCN\t\t11";
+    let countries = "CN\t\t\t\t中国";
+    GeoNames::parse(cities, None, Some(countries))
+}
+
+/// An album entry as the store would hold it for a photo classified at (lat, lon).
+fn entry_for(id: PhotoId, lat: f64, lon: f64, city: &str) -> store::Entry {
+    store::Entry { id: id.0, country: "中国".to_string(), city: city.to_string(), iso: "CN".to_string(), distance: 8000.0, lat, lon }
+}
+
+#[test]
+fn a_new_gps_photo_joins_the_album_automatically() {
+    let (mut app, a, _) = demo();
+    set_gps(&mut app, a, 30.3, 120.2);
+    let mut st = State::default();
+    sync_diff(&app, &mut st);
+    assert_eq!(st.sync.queue, vec![a], "the photo with GPS is queued; the GPS-less demo photos are not");
+    assert_eq!(st.no_gps, app.session.catalog.photos().filter(|p| p.in_library()).count() - 1);
+    sync_process(&app, &mut st, &gazetteer());
+    let e = st.store.entry(a).expect("the photo joined the album");
+    assert_eq!((e.country.as_str(), e.city.as_str(), e.iso.as_str()), ("中国", "杭州", "CN"));
+    assert!(e.at_basis(30.3, 120.2), "the entry records the GPS it classified");
+    assert_eq!(st.added, 1, "the auto-add is counted for the album card");
+    assert!(st.store_dirty, "the store waits for its file save");
+    // and the second pass finds nothing to do: the album is incremental, not a full re-lookup
+    st.sync.baseline = Some(app.session.catalog.revision);
+    sync_diff(&app, &mut st);
+    assert!(st.sync.queue.is_empty(), "an already-classified photo is not re-queued");
+}
+
+#[test]
+fn a_moved_photo_is_reclassified() {
+    let (mut app, a, _) = demo();
+    // the photo was classified in Beijing, then its GPS was corrected to Hangzhou
+    let mut st = State { parent: "地点".to_string(), ..State::default() };
+    st.store.insert(entry_for(a, 39.9, 116.4, "北京"));
+    set_gps(&mut app, a, 30.3, 120.2);
+    sync_diff(&app, &mut st);
+    assert!(st.sync.queue.contains(&a), "the moved photo is queued again");
+    sync_process(&app, &mut st, &gazetteer());
+    let e = st.store.entry(a).expect("the entry is rewritten");
+    assert_eq!(e.city, "杭州", "the place follows the photo's GPS");
+    assert!(e.at_basis(30.3, 120.2));
+}
+
+#[test]
+fn a_photo_that_lost_its_gps_leaves_the_album() {
+    let (app, a, _) = demo();
+    // the demo photo carries no GPS; its stale entry is pruned, not drawn
+    let mut st = State { parent: "地点".to_string(), ..State::default() };
+    st.store.insert(entry_for(a, 30.3, 120.2, "杭州"));
+    sync_diff(&app, &mut st);
+    assert!(st.store.entry(a).is_none(), "the GPS-less photo's entry is pruned");
+    assert!(st.store_dirty, "the prune waits for its file save");
+    assert!(st.sync.queue.is_empty());
+}
+
+#[test]
+fn an_unmatched_photo_is_recorded_and_not_requeued() {
+    let (mut app, a, _) = demo();
+    // an ocean position is farther than GeoNames' 50 km reach from any synthetic city
+    set_gps(&mut app, a, 0.0, 0.0);
+    let mut st = State::default();
+    sync_diff(&app, &mut st);
+    sync_process(&app, &mut st, &gazetteer());
+    let e = st.store.entry(a).expect("the photo is recorded");
+    assert!(e.unmatched(), "no place found: a bare entry");
+    assert_eq!(st.unmatched, 0, "the snapshot counts the unmatched, and has not rebuilt yet");
+    sync_snapshot(&app, &mut st);
+    assert_eq!(st.unmatched, 1);
+    // the next pass skips it instead of looking it up again
+    st.sync.baseline = Some(app.session.catalog.revision);
+    sync_diff(&app, &mut st);
+    assert!(st.sync.queue.is_empty(), "an unmatched photo is not re-looked-up");
+}
+
+#[test]
+fn a_touched_pass_queues_only_the_changed_photos() {
+    let (mut app, a, b) = demo();
+    set_gps(&mut app, a, 30.3, 120.2);
+    set_gps(&mut app, b, 39.9, 116.4);
+    let mut st = State::default();
+    sync_diff(&app, &mut st);
+    sync_process(&app, &mut st, &gazetteer());
+    let before = app.session.catalog.revision;
+    // move one photo while the page is closed; the album follows it alone
+    set_gps(&mut app, b, 30.35, 120.2);
+    st.sync.baseline = Some(before);
+    sync_diff(&app, &mut st);
+    assert_eq!(st.sync.queue, vec![b], "only the touched photo is queued");
+    sync_process(&app, &mut st, &gazetteer());
+    assert_eq!(st.store.entry(b).expect("the moved photo re-classified").city, "杭州");
+}
+
+#[test]
+fn another_library_starts_with_an_empty_album() {
+    let (mut app, a, _) = demo();
+    let mut st = State { parent: "地点".to_string(), loaded_gen: Some(app.session.library_generation()), ..State::default() };
+    st.sync.queue.push(a);
+    st.store.insert(store::Entry {
+        id: a.0,
+        country: "中国".to_string(),
+        city: "杭州".to_string(),
+        iso: "CN".to_string(),
+        distance: 8000.0,
+        lat: 30.3,
+        lon: 120.2,
+    });
+    // a new session is another library generation: the album is bound to the library, so the old
+    // entries do not carry over
+    app.session = Session::with_demo();
+    super::pump_album(&mut app, &egui::Context::default(), &mut st);
+    assert!(st.store.photos.is_empty(), "the new library's album starts empty");
+    assert_eq!(st.parent, super::PARENT_DEFAULT, "an empty library does not inherit the previous parent's keyword");
+    assert!(!st.sync.queue.contains(&a), "queued photo ids from the previous library are discarded");
+    assert_eq!(st.phase, super::Phase::Idle, "the new library opens on its album page");
+    assert_eq!(st.loaded_gen, Some(app.session.library_generation()));
+}
+
+#[test]
+fn the_first_pass_diffs_once_and_the_queue_survives_until_drained() {
+    let (mut app, a, _) = demo();
+    set_gps(&mut app, a, 30.3, 120.2);
+    let mut st = State::default();
+    super::pump_album(&mut app, &egui::Context::default(), &mut st);
+    let queued_or_done = st.sync.queue.contains(&a) || st.store.entry(a).is_some();
+    assert!(queued_or_done, "the GPS photo is picked up by the first pass (processed at once on a machine with the dataset, queued without it)");
+    let other: Vec<_> = st.store.photos.keys().copied().filter(|id| *id != a.0).collect();
+    assert!(other.is_empty(), "GPS-less demo photos are not picked up: {other:?}");
+}
+
+// ---------------------------------------------------------------- the write from the album
 
 fn state_with(places: Vec<PhotoPlace>, parent: &str) -> State {
     State { parent: parent.to_string(), places, ..State::default() }
@@ -147,6 +285,36 @@ fn nothing_new_commits_nothing() {
 }
 
 #[test]
+fn the_review_writes_only_the_pending_and_the_album_survives() {
+    let (mut app, a, b) = demo();
+    set_gps(&mut app, a, 30.3, 120.2);
+    set_gps(&mut app, b, 39.9, 116.4);
+    let mut st = State { parent: "地点".to_string(), ..State::default() };
+    sync_diff(&app, &mut st);
+    sync_process(&app, &mut st, &gazetteer());
+    assert_eq!(st.store.photos.len(), 2, "both photos joined the album");
+    sync_snapshot(&app, &mut st);
+    assert_eq!(st.pending.len(), 2, "neither carries the keyword yet");
+    // photo a already carries its place: it stays in the album but leaves the pending write
+    let meta = Meta { keywords: vec!["地点|中国|杭州".to_string()], ..app.session.catalog.photo(a).unwrap().meta.clone() };
+    app.session.commit("test", Op::SetMeta { id: a, meta: Box::new(meta) }).unwrap();
+    sync_snapshot(&app, &mut st);
+    assert_eq!(st.pending.len(), 1, "only the un-keyworded photo is pending");
+    assert_eq!(st.pending[0].id, b);
+    // the review writes only what is pending; the album keeps everything
+    write_review(&mut app, &mut st);
+    assert_eq!(st.applied.as_ref().map(|r| r.photos), Some(1));
+    assert!(app.session.catalog.photo(b).unwrap().meta.keywords.contains(&"地点|中国|北京".to_string()));
+    assert_eq!(st.store.photos.len(), 2, "the album is untouched by the write");
+    sync_snapshot(&app, &mut st);
+    assert!(st.pending.is_empty(), "after the write nothing is pending");
+    // and undoing the batch puts it back
+    app.run("edit.undo", Value::Null).unwrap();
+    sync_snapshot(&app, &mut st);
+    assert_eq!(st.pending.len(), 1, "the undone photo is pending again");
+}
+
+#[test]
 fn review_counts_follow_the_boxes() {
     let mut st = State {
         places: vec![place(1, "a.jpg", "中国", "杭州"), place(2, "b.jpg", "中国", "杭州"), place(3, "c.jpg", "日本", "东京")],
@@ -191,10 +359,10 @@ fn zooming_keeps_the_point_under_the_anchor() {
 }
 
 #[test]
-fn the_view_is_clamped_to_china() {
+fn the_view_is_clamped_to_world_bounds() {
     let mut v = MapView { c_lon: 500.0, c_lat: -200.0, span_lon: 500.0 };
     map::clamp_view(&mut v);
-    assert!(v.span_lon <= 70.0 && (75.0..=134.0).contains(&v.c_lon) && (16.0..=53.0).contains(&v.c_lat));
+    assert!(v.span_lon <= 360.0 && (-180.0..=180.0).contains(&v.c_lon) && (-80.0..=85.0).contains(&v.c_lat));
     let mut v = MapView { c_lon: 0.0, c_lat: 0.0, span_lon: 0.1 };
     map::clamp_view(&mut v);
     assert!(v.span_lon >= 0.02, "a too-deep zoom is lifted to the street-level floor");
@@ -222,9 +390,17 @@ fn chinese_groups_become_map_points_and_foreign_ones_do_not() {
 
 // ---------------------------------------------------------------- the page
 
-fn with_review_state(places: Vec<PhotoPlace>, parent: &str) {
-    let mut st = state_with(places, parent);
+/// Install a Review state over the demo app's *injected* places: the page state looks exactly as
+/// it does after the first pump (library generation recorded, sync baseline set), and the
+/// snapshot key matches the current catalog — so the page keeps the injected places instead of
+/// rebuilding them from the (empty, memory-only) store.
+fn with_review_state(app: &LightcraftApp, places: Vec<PhotoPlace>, parent: &str) {
+    let mut st = state_with(places.clone(), parent);
+    st.pending = places; // the review draws what the album still has to write
     st.phase = super::Phase::Review;
+    st.loaded_gen = Some(app.session.library_generation());
+    st.sync.baseline = Some(app.session.catalog.revision);
+    st.snapshot = Some((0, app.session.catalog.revision, parent.to_string()));
     *lock() = st;
 }
 
@@ -254,10 +430,60 @@ fn the_page_renders_headless_and_names_the_dataset_state() {
 }
 
 #[test]
+fn the_album_card_renders_the_stored_album_headless() {
+    let _page = super::page_test_lock();
+    let (mut app, a, b) = demo();
+    set_gps(&mut app, a, 30.3, 120.2);
+    set_gps(&mut app, b, 39.9, 116.4);
+    // photo a already carries its place: in the album, but not in the pending write
+    let meta = Meta { keywords: vec!["地点|中国|杭州".to_string()], ..app.session.catalog.photo(a).unwrap().meta.clone() };
+    app.session.commit("test", Op::SetMeta { id: a, meta: Box::new(meta) }).unwrap();
+    let mut album = store::Album { version: store::VERSION, parent: "地点".to_string(), photos: Default::default(), tracks: Vec::new() };
+    album.insert(store::Entry {
+        id: a.0,
+        country: "中国".to_string(),
+        city: "杭州".to_string(),
+        iso: "CN".to_string(),
+        distance: 8000.0,
+        lat: 30.3,
+        lon: 120.2,
+    });
+    album.insert(store::Entry {
+        id: b.0,
+        country: "中国".to_string(),
+        city: "北京".to_string(),
+        iso: "CN".to_string(),
+        distance: 8000.0,
+        lat: 39.9,
+        lon: 116.4,
+    });
+    *lock() = State {
+        parent: "地点".to_string(),
+        loaded_gen: Some(app.session.library_generation()),
+        store: album,
+        status_at: Some(Instant::now()),
+        ..State::default()
+    };
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(520.0, 900.0), 1.0, 0.0, vec![]);
+    let _ = view.run(input, |ui| page(&mut app, ui));
+    let text = view.painted_text().join("\n");
+    assert!(text.contains("Map album"), "the album card: {text}");
+    assert!(text.contains("2 in the album"), "both album photos are counted: {text}");
+    assert!(text.contains("1 to write"), "the already-keyworded photo is not pending: {text}");
+    let registered = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    assert!(registered.iter().any(|(id, _)| id == "geo:map"), "the album map is registered for automation");
+    assert!(registered.iter().any(|(id, _)| id == "geo:map:bubble:0"), "the album's places are on the map");
+    assert!(registered.iter().any(|(id, _)| id == "geo:start"), "the write action is in the sticky footer");
+    *lock() = State::default();
+}
+
+#[test]
 fn the_review_renders_the_map_with_bubbles_headless() {
     let _page = super::page_test_lock();
     let (mut app, a, b) = demo();
     with_review_state(
+        &app,
         vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4), place_at(b.0, "b.jpg", "中国", "杭州", "CN", 30.27, 120.16)],
         "地点",
     );
@@ -289,7 +515,7 @@ fn the_review_renders_the_map_with_bubbles_headless() {
 fn cached_basemap_tiles_are_painted_with_the_attribution() {
     let _page = super::page_test_lock();
     let (mut app, a, _) = demo();
-    with_review_state(vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
+    with_review_state(&app, vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
     let size = vec2(520.0, 780.0);
     let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, 0.0, vec![]), |ui| page(&mut app, ui));
@@ -313,7 +539,8 @@ fn clicking_a_bubble_opens_the_place_card() {
     let _page = super::page_test_lock();
     let (mut app, a, b) = demo();
     with_review_state(
-        vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4), place_at(b.0, "b.jpg", "中国", "杭州", "CN", 30.27, 120.16)],
+        &app,
+        vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4), place_at(b.0, "b.jpg", "中国", "北京", "CN", 39.91, 116.41)],
         "地点",
     );
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
@@ -345,6 +572,91 @@ fn clicking_a_bubble_opens_the_place_card() {
     let text = view.painted_text().join("\n");
     assert!(text.contains("Include in write"), "the place card is open: {text}");
     assert!(text.contains("Focus on the place"), "the card offers the focus jump: {text}");
+    assert!(
+        lightcraft_ui_egui::widgets::take_registry(&view.ctx).iter().any(|(id, _)| id == "geo:map:select"),
+        "the place card offers selecting its photos in the library"
+    );
+    *lock() = State::default();
+}
+
+#[test]
+fn selecting_a_place_selects_all_its_photos_in_the_library() {
+    let (mut app, a, b) = demo();
+    let photos = vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4), place_at(b.0, "b.jpg", "中国", "北京", "CN", 39.91, 116.41)];
+    let points = map::map_points(&groups("地点", &photos));
+    let point = points.first().expect("the China group becomes a map point");
+    map::select_place_photos(&mut app, point).expect("the library selection command succeeds");
+    assert_eq!(app.session.selection.ids, vec![a, b], "every photo at the place is selected");
+    assert_eq!(app.session.selection.active, Some(a), "the first photo is active");
+}
+
+#[test]
+fn focusing_a_track_frames_routes_outside_china() {
+    let track = lightcraft_meta::parse_gpx(
+        r#"<gpx version="1.1" creator="test"><trk><trkseg>
+           <trkpt lat="46" lon="7"><time>2026-05-01T10:00:00Z</time></trkpt>
+           <trkpt lat="47" lon="8"><time>2026-05-01T10:01:00Z</time></trkpt>
+        </trkseg></trk></gpx>"#,
+    )
+    .expect("the synthetic GPX parses");
+    let view = map::fit_track(&track).expect("the route has positions");
+    assert!(view.c_lat > 45.0 && view.c_lat < 48.0);
+    assert!(view.c_lon > 6.0 && view.c_lon < 9.0);
+    let mut view = view;
+    map::clamp_view(&mut view);
+    assert!(view.c_lat > 45.0 && view.c_lon < 9.0, "the map camera accepts locations outside China");
+}
+
+#[test]
+fn the_map_paints_the_gpx_route_overlay() {
+    let _page = super::page_test_lock();
+    let (mut app, a, _) = demo();
+    let log = lightcraft_meta::parse_gpx(
+        r#"<gpx version="1.1" creator="test"><trk><trkseg>
+           <trkpt lat="30.2" lon="120.1"><time>2026-05-01T10:00:00Z</time></trkpt>
+           <trkpt lat="30.3" lon="120.2"><time>2026-05-01T10:01:00Z</time></trkpt>
+        </trkseg></trk></gpx>"#,
+    )
+    .expect("the synthetic GPX parses");
+    with_review_state(&app, vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16)], "地点");
+    lock().tracks.push(TrackOverlay { path: "trip.gpx".to_string(), name: "trip.gpx".to_string(), log: std::sync::Arc::new(log) });
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(520.0, 780.0), 1.0, 0.0, vec![]);
+    let _ = view.run(input, |ui| page(&mut app, ui));
+    let route = egui::Color32::from_rgb(0x0b, 0x7f, 0x87);
+    assert!(
+        view.painted_shapes().iter().any(|shape| matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == route)),
+        "the track's route stroke is painted"
+    );
+    *lock() = State::default();
+}
+
+#[test]
+fn the_album_lists_track_actions_and_a_selection_count() {
+    let _page = super::page_test_lock();
+    let (mut app, _, _) = demo();
+    let log = lightcraft_meta::parse_gpx(
+        r#"<gpx version="1.1" creator="test"><trk><trkseg>
+           <trkpt lat="30.2" lon="120.1"><time>2026-05-01T10:00:00Z</time></trkpt>
+           <trkpt lat="30.3" lon="120.2"><time>2026-05-01T10:01:00Z</time></trkpt>
+        </trkseg></trk></gpx>"#,
+    )
+    .expect("the synthetic GPX parses");
+    *lock() = State {
+        loaded_gen: Some(app.session.library_generation()),
+        tracks: vec![TrackOverlay { path: "trip.gpx".to_string(), name: "trip.gpx".to_string(), log: std::sync::Arc::new(log) }],
+        ..State::default()
+    };
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(520.0, 900.0), 1.0, 0.0, vec![]);
+    let _ = view.run(input, |ui| page(&mut app, ui));
+    let text = view.painted_text().join("\n");
+    assert!(text.contains("trip.gpx · 2 points"), "the imported track is listed: {text}");
+    let ids: Vec<String> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().map(|(id, _)| id).collect();
+    assert!(ids.iter().any(|id| id == "geo:track:add"), "the album can add another GPX track");
+    assert!(ids.iter().any(|id| id == "geo:track:focus:0"), "the route can be framed");
+    assert!(ids.iter().any(|id| id == "geo:track:match:0"), "the selected photos can be time-matched");
+    assert!(ids.iter().any(|id| id == "geo:track:remove:0"), "the imported route can be removed");
     *lock() = State::default();
 }
 
@@ -352,7 +664,7 @@ fn clicking_a_bubble_opens_the_place_card() {
 fn the_wheel_zooms_the_map_around_the_pointer() {
     let _page = super::page_test_lock();
     let (mut app, a, _) = demo();
-    with_review_state(vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
+    with_review_state(&app, vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
     let size = vec2(520.0, 780.0);
     let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, 0.0, vec![]), |ui| page(&mut app, ui));
@@ -386,7 +698,7 @@ fn the_wheel_zooms_the_map_around_the_pointer() {
 fn dragging_pans_the_map() {
     let _page = super::page_test_lock();
     let (mut app, a, _) = demo();
-    with_review_state(vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
+    with_review_state(&app, vec![place_at(a.0, "a.jpg", "中国", "北京", "CN", 39.9, 116.4)], "地点");
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
     let size = vec2(520.0, 780.0);
     let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, 0.0, vec![]), |ui| page(&mut app, ui));
@@ -425,7 +737,7 @@ fn dragging_pans_the_map() {
 fn zoomed_in_the_bubbles_become_thumbnails_that_open_the_detail_view() {
     let _page = super::page_test_lock();
     let (mut app, a, _) = demo();
-    with_review_state(vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16)], "地点");
+    with_review_state(&app, vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16)], "地点");
     lock().map = MapView { c_lon: 120.16, c_lat: 30.27, span_lon: map::THRESH * 0.5 };
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
     let size = vec2(520.0, 780.0);
@@ -451,24 +763,24 @@ fn zoomed_in_the_bubbles_become_thumbnails_that_open_the_detail_view() {
 }
 
 #[test]
-fn back_to_idle_clears_the_run_but_keeps_the_settings() {
+fn back_to_idle_keeps_the_album_but_clears_the_run() {
     let mut st = State {
         parent: "地点".to_string(),
         places: vec![place(1, "a.jpg", "中国", "杭州")],
-        without_gps: 3,
+        no_gps: 3,
         error: Some("x".to_string()),
         ..State::default()
     };
     st.groups_off.insert("地点|中国|杭州".to_string());
     st.applied = Some(Applied { photos: 1, keywords: 1, undone: false });
     back_to_idle(&mut st);
-    assert!(st.places.is_empty());
-    assert_eq!(st.without_gps, 0);
+    assert_eq!(st.places.len(), 1, "the album survives: it is the page's own data, not the run's");
+    assert_eq!(st.no_gps, 3);
     assert!(st.error.is_none());
     assert!(st.applied.is_none());
     assert!(st.groups_off.is_empty());
     assert_eq!(st.parent, "地点", "the parent keyword survives");
-    assert_eq!(st.map, NATIONAL, "the map view resets for the next run");
+    assert_eq!(st.map, NATIONAL, "the map view resets for the next look");
 }
 
 #[test]

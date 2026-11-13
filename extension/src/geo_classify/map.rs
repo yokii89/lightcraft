@@ -11,6 +11,7 @@
 //! boundaries are original simplified vectors (our own work, recorded in
 //! `assets/ATTRIBUTION.md`); the on-map note stays until standard boundary data replaces them.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use egui::{
@@ -22,7 +23,9 @@ use lightcraft_ui_egui::panels::grid::request_thumb;
 use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::{i18n, icons, widgets};
 
-use super::{Group, State};
+use lightcraft_meta::{TrackPoint, Tracklog};
+
+use super::{Group, MAX_DRAWN_TRACK_POINTS, State, TrackOverlay};
 use crate::tiles;
 use crate::ui::trn;
 
@@ -227,7 +230,7 @@ pub(crate) const NATIONAL: MapView = MapView { c_lon: 104.5, c_lat: 36.2, span_l
 /// Zoom bounds, in degrees of longitude across the view. The deep end reaches AMap's street
 /// level (z16) so the online basemap is useful down to a neighbourhood.
 const MIN_SPAN: f64 = 0.02;
-const MAX_SPAN: f64 = 70.0;
+const MAX_SPAN: f64 = 360.0;
 /// Below this span (degrees of longitude across the view) bubbles split into photo thumbnails.
 pub(crate) const THRESH: f64 = 9.0;
 /// Zoom factor per wheel line-notch.
@@ -269,11 +272,26 @@ pub(crate) fn zoom_around(view: MapView, factor: f64, at: (f64, f64), rect: Rect
     MapView { c_lon, c_lat, span_lon: span }
 }
 
-/// Keep the view inside China's neighbourhood.
+/// Keep the view inside the world bounds; the default camera is still centred on China.
 pub(crate) fn clamp_view(view: &mut MapView) {
     view.span_lon = view.span_lon.clamp(MIN_SPAN, MAX_SPAN);
-    view.c_lon = view.c_lon.clamp(75.0, 134.0);
-    view.c_lat = view.c_lat.clamp(16.0, 53.0);
+    view.c_lon = view.c_lon.clamp(-180.0, 180.0);
+    view.c_lat = view.c_lat.clamp(-80.0, 85.0);
+}
+
+/// Camera covering a track with room around its edges.
+pub(crate) fn fit_track(log: &Tracklog) -> Option<MapView> {
+    let first = log.points.first()?;
+    let (mut min_lat, mut max_lat, mut min_lon, mut max_lon) = (first.latitude, first.latitude, first.longitude, first.longitude);
+    for p in &log.points {
+        min_lat = min_lat.min(p.latitude);
+        max_lat = max_lat.max(p.latitude);
+        min_lon = min_lon.min(p.longitude);
+        max_lon = max_lon.max(p.longitude);
+    }
+    let lat_span = (max_lat - min_lat) * 1.5;
+    let span_lon = ((max_lon - min_lon).max(lat_span).max(0.2) * 1.35).clamp(MIN_SPAN, MAX_SPAN);
+    Some(MapView { c_lon: (min_lon + max_lon) * 0.5, c_lat: (min_lat + max_lat) * 0.5, span_lon })
 }
 
 /// The lat/lon → pixels transform for one frame: Web Mercator, on AMap's GCJ-02 datum so the
@@ -431,11 +449,20 @@ struct Ctx<'a> {
 
 /// The map fills the review: allocate, read input, paint the base, the items, the popup and the
 /// floating controls. The map is the whole interaction surface; `st` carries view and selection.
-pub(crate) fn draw_map(app: &mut lightcraft_ui_egui::LightcraftApp, ui: &mut Ui, st: &mut State, all: &[Group]) {
+/// `fixed_height` pins the height (the album card); `None` fills what the panel leaves (the
+/// review).
+pub(crate) fn draw_map(
+    app: &mut lightcraft_ui_egui::LightcraftApp,
+    ui: &mut Ui,
+    st: &mut State,
+    all: &[Group],
+    tracks: &[TrackOverlay],
+    fixed_height: Option<f32>,
+) {
     let t = Tokens::get(ui.ctx());
     let dark = lightcraft_ui_egui::theme::current(ui.ctx()).unwrap_or_default().is_dark();
     let mut points = map_points(all);
-    if points.is_empty() {
+    if points.is_empty() && tracks.is_empty() {
         ui.add_space(6.0);
         ui.label(RichText::new(i18n::tr("No places in China to show on the map.")).font(t.font(11.0)).color(t.text_dim));
         return;
@@ -443,7 +470,7 @@ pub(crate) fn draw_map(app: &mut lightcraft_ui_egui::LightcraftApp, ui: &mut Ui,
     for p in &mut points {
         p.off = st.groups_off.contains(&p.path);
     }
-    let height = (ui.available_height() - BELOW_RESERVE).clamp(MIN_MAP_H, 760.0);
+    let height = fixed_height.unwrap_or_else(|| (ui.available_height() - BELOW_RESERVE).clamp(MIN_MAP_H, 760.0));
     let (rect, base) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
     widgets::register(ui, "geo:map", rect);
     let c = map_colors(dark, t);
@@ -463,6 +490,7 @@ pub(crate) fn draw_map(app: &mut lightcraft_ui_egui::LightcraftApp, ui: &mut Ui,
         // the basemap is light even in the dark theme: labels need a dark ink to stay readable
         cx.c.land_text = Color32::from_rgb(0x33, 0x33, 0x33);
     }
+    draw_tracks(&cx.painter, &cx.cam, rect, tracks, &cx.t);
     let (item_drag, item_hit) = if cx.view.span_lon <= THRESH { draw_thumbs(app, st, &points, &mut cx) } else { draw_bubbles(st, &points, &mut cx) };
     let base_drag = if base.dragged_by(PointerButton::Primary) { base.drag_delta() } else { Vec2::ZERO };
     apply_pan(&mut *cx.ui, st, &base, item_drag + base_drag, rect, item_hit);
@@ -474,7 +502,7 @@ pub(crate) fn draw_map(app: &mut lightcraft_ui_egui::LightcraftApp, ui: &mut Ui,
         }
         paint_note(&cx.t, &cx.painter, rect);
     }
-    draw_popup(st, &points, &mut cx, rect);
+    draw_popup(app, st, &points, &mut cx, rect);
     draw_controls(st, &mut *cx.ui, rect);
     draw_online_toggle(st, &mut *cx.ui, rect);
 }
@@ -852,12 +880,64 @@ fn apply_pan(ui: &mut Ui, st: &mut State, base: &egui::Response, drag: Vec2, rec
     }
 }
 
+/// Paint each logged segment independently so a GPS outage never becomes an invented straight line.
+fn draw_tracks(painter: &Painter, cam: &Cam, rect: Rect, tracks: &[TrackOverlay], t: &Tokens) {
+    let route = Color32::from_rgb(0x0b, 0x7f, 0x87);
+    let halo = Color32::from_white_alpha(230);
+    for track in tracks {
+        let mut segments: BTreeMap<u32, Vec<&TrackPoint>> = BTreeMap::new();
+        for point in &track.log.points {
+            segments.entry(point.segment).or_default().push(point);
+        }
+        for points in segments.values() {
+            if points.is_empty() {
+                continue;
+            }
+            let stride = points.len().div_ceil(MAX_DRAWN_TRACK_POINTS).max(1);
+            let mut sampled: Vec<&TrackPoint> = points.iter().step_by(stride).copied().collect();
+            if let Some(last) = points.last()
+                && sampled.last().is_none_or(|p| !std::ptr::eq(*p, *last))
+            {
+                sampled.push(last);
+            }
+            let mut previous: Option<&TrackPoint> = None;
+            for point in sampled {
+                if let Some(prev) = previous
+                    && (point.longitude - prev.longitude).abs() <= 180.0
+                {
+                    let a = cam.to_px(prev.latitude, prev.longitude);
+                    let b = cam.to_px(point.latitude, point.longitude);
+                    if rect.intersects(Rect::from_two_pos(a, b).expand(3.0)) {
+                        painter.line_segment([a, b], Stroke::new(5.0, halo));
+                        painter.line_segment([a, b], Stroke::new(2.5, route));
+                    }
+                }
+                previous = Some(point);
+            }
+            if let Some(first) = points.first() {
+                let at = cam.to_px(first.latitude, first.longitude);
+                if rect.expand(5.0).contains(at) {
+                    painter.circle_filled(at, 4.0, Color32::WHITE);
+                    painter.circle_filled(at, 2.5, route);
+                }
+            }
+            if let Some(last) = points.last() {
+                let at = cam.to_px(last.latitude, last.longitude);
+                if rect.expand(5.0).contains(at) {
+                    painter.circle_filled(at, 4.0, Color32::WHITE);
+                    painter.circle_filled(at, 2.5, t.accent);
+                }
+            }
+        }
+    }
+}
+
 /// The selected bubble's card: include in write / focus / close.
-fn draw_popup(st: &mut State, points: &[MapPoint], cx: &mut Ctx, rect: Rect) {
+fn draw_popup(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, points: &[MapPoint], cx: &mut Ctx, rect: Rect) {
     let Some(sel) = st.map_sel.clone() else { return };
     let Some(p) = points.iter().find(|p| p.path == sel) else { return };
     let pos = cx.cam.to_px(p.center.0, p.center.1);
-    let size = vec2(190.0, 118.0);
+    let size = vec2(190.0, 156.0);
     let mut origin = pos2(pos.x + bubble_radius(p.count) + 10.0, pos.y - 12.0);
     origin.x = origin.x.min(rect.right() - size.x - 6.0).max(rect.left() + 6.0);
     origin.y = origin.y.min(rect.bottom() - size.y - 6.0).max(rect.top() + 6.0);
@@ -897,6 +977,12 @@ fn draw_popup(st: &mut State, points: &[MapPoint], cx: &mut Ctx, rect: Rect) {
                     }
                 }
                 ui.add_space(4.0);
+                if Button::new(i18n::tr("Select place photos")).secondary().small().widget("geo:map:select").show(ui).clicked()
+                    && let Err(e) = select_place_photos(app, p)
+                {
+                    st.error = Some(e);
+                }
+                ui.add_space(4.0);
                 if Button::new(i18n::tr("Focus on the place")).secondary().small().widget("geo:map:focus").show(ui).clicked() {
                     st.map = MapView { c_lon: p.center.1, c_lat: p.center.0, span_lon: 3.2 };
                     st.map_sel = None;
@@ -904,6 +990,12 @@ fn draw_popup(st: &mut State, points: &[MapPoint], cx: &mut Ctx, rect: Rect) {
             },
         );
     });
+}
+
+pub(super) fn select_place_photos(app: &mut lightcraft_ui_egui::LightcraftApp, place: &MapPoint) -> Result<(), String> {
+    let ids: Vec<u64> = place.photos.iter().map(|(id, _, _, _, _)| id.0).collect();
+    let active = place.photos.first().map(|photo| photo.0.0);
+    app.run("library.select", serde_json::json!({ "ids": ids, "active": active })).map(|_| ())
 }
 
 /// The preset chips (top left) and the zoom buttons (top right), as foreground areas.
