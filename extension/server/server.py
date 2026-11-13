@@ -271,9 +271,9 @@ class Service:
                 torch.backends.cudnn.allow_tf32 = True
                 self.require_free_vram(torch)
             source = self.resolve_model_source()
-            # bf16 (the checkpoint's dtype) on the GPU; float32 runs faster on most CPUs,
-            # which lack native bf16 arithmetic.
-            dtype = "float32" if device == "cpu" else "auto"
+            # Keep the tested, unquantized BF16 path explicit: INT8 was slower and NF4
+            # lost output-schema compliance. CPU debugging keeps float32 arithmetic.
+            dtype = torch.float32 if device == "cpu" else torch.bfloat16
             log(f"loading {source} on {device} ({dtype}) …")
             started = time.time()
             processor = AutoProcessor.from_pretrained(source)

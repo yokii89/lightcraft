@@ -17,12 +17,25 @@ lightcraft-catalog = { workspace = true }
 lightcraft-codecs = { workspace = true }
 lightcraft-geocode = { workspace = true }
 lightcraft-meta = { workspace = true }
+lightcraft-fetch = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+sha2 = { workspace = true }
+rayon = { workspace = true }
+# Apache-2.0; disable the Oniguruma and esaxx C/C++ backends.
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 egui = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 ureq = "3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lightcraft-gpu = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 lightcraft-testkit = { workspace = true }

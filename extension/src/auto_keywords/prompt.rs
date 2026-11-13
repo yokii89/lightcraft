@@ -21,21 +21,15 @@ pub const OTHER: &str = "其他";
 
 /// The most characters of one keyword: a rambling model answer must not become a paragraph.
 pub const MAX_KEYWORD_CHARS: usize = 32;
+pub const MAX_DESCRIPTION_CHARS: usize = 256;
 
 /// The prompt sent with every photo (per §7.1 of the design). Sent fresh each time: no model-side
 /// state is kept between photos.
 pub fn prompt_text(max_keywords: usize) -> String {
-    format!(
-        "你是照片图库的自动打标助手。看这张照片，只输出一个 JSON 对象，不要解释：\n\
-         {{\"category\":\"风景\",\"keywords\":[\"雪山\",\"湖泊\",\"日落\"]}}\n\
-         \n\
-         要求：\n\
-         1. category 只能是以下之一：{}。\n\
-         2. keywords 为 2 到 {} 个简体中文词，具体、可检索；不要句子、不要相机参数、不要猜测真实姓名或具体地点。\n\
-         3. 不要重复 category 或 keywords 中已有的词。",
-        CATEGORIES.join("、"),
-        max_keywords.max(2),
-    )
+    include_str!("prompt.txt")
+        .trim()
+        .replace("{categories}", &CATEGORIES.join("、"))
+        .replace("{max_keywords}", &max_keywords.clamp(1, 16).to_string())
 }
 
 /// One photo's cleaned analysis.
@@ -43,6 +37,8 @@ pub fn prompt_text(max_keywords: usize) -> String {
 pub struct Analysis {
     /// One of [`CATEGORIES`].
     pub category: String,
+    /// Objective AI description; empty for older keyword-only services.
+    pub description: String,
     /// Cleaned, deduplicated, at most `max_keywords` of them.
     pub keywords: Vec<String>,
 }
@@ -172,5 +168,7 @@ pub fn parse(content: &str, max_keywords: usize, parent: &str) -> Result<Analysi
     if keywords.is_empty() {
         return Err(ParseError::NoKeywords);
     }
-    Ok(Analysis { category, keywords })
+    let raw = v.get("description").and_then(Value::as_str).unwrap_or_default();
+    let description: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).take(MAX_DESCRIPTION_CHARS).collect();
+    Ok(Analysis { category, description: description.trim().to_string(), keywords })
 }

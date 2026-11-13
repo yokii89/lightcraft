@@ -88,6 +88,8 @@ struct PhotoResult {
     id: PhotoId,
     name: String,
     category: String,
+    description: String,
+    basis: [u8; 32],
     keywords: Vec<String>,
     seconds: f64,
 }
@@ -124,6 +126,7 @@ struct Job {
     id: PhotoId,
     name: String,
     render: RenderJob,
+    basis: [u8; 32],
 }
 
 /// Worker → UI thread: one photo's outcome.
@@ -257,6 +260,14 @@ fn load_settings(app: &LightcraftApp, st: &mut State) {
     if st.loaded_gen == Some(library_gen) {
         return;
     }
+    // A result for the previous library must never write to the newly opened one.
+    st.cancel.store(true, Ordering::Relaxed);
+    st.done_feeding.store(true, Ordering::Release);
+    st.job_tx = None;
+    st.done_rx = None;
+    st.results.clear();
+    st.activity = None;
+    st.phase = Phase::Idle;
     st.loaded_gen = Some(library_gen);
     if let Some(path) = config::settings_path(library_dir(app).as_deref()) {
         st.settings = config::read(&path);
@@ -344,8 +355,9 @@ fn pump(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
         if let Some((id, name)) = st.entries.get(st.next_index).cloned() {
             match app.session.render_job(id, SEND_EDGE, SEND_EDGE, false, false) {
                 Some(render) => {
+                    let basis = app.session.catalog.photo(id).map(|p| crate::semantic_search::store::basis(p)).unwrap_or_default();
                     let sent = match (&st.job_tx, &st.run_config) {
-                        (Some(tx), Some(config)) => tx.send(Job { config: config.clone(), id, name: name.clone(), render }).is_ok(),
+                        (Some(tx), Some(config)) => tx.send(Job { config: config.clone(), id, name: name.clone(), render, basis }).is_ok(),
                         _ => false,
                     };
                     if sent {
@@ -413,6 +425,7 @@ fn start_run(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State, entri
 /// The machinery every run shares: the worker thread, the channels, the cancel flag, the activity
 /// row, the state reset. Tests inject the config directly (a dead endpoint, a mock).
 fn begin_run(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State, entries: Vec<(PhotoId, String)>, skipped: usize, config: Arc<RunConfig>) {
+    st.loaded_gen = Some(app.session.library_generation());
     let cancel = Arc::new(AtomicBool::new(false));
     let done_feeding = Arc::new(AtomicBool::new(false));
     let (job_tx, job_rx) = channel();
@@ -503,7 +516,15 @@ fn process(job: Job, cancel: &AtomicBool) -> Outcome {
     match vlm::analyze(&config.endpoint, &config.token, &config.model, &config.prompt, &image_b64, config.stall_secs, Some(cancel)) {
         Err(reason) => failure(reason),
         Ok(text) => match prompt::parse(&text, config.max_keywords, &config.parent) {
-            Ok(a) => Outcome::Done(PhotoResult { id, name, category: a.category, keywords: a.keywords, seconds: started.elapsed().as_secs_f64() }),
+            Ok(a) => Outcome::Done(PhotoResult {
+                id,
+                name,
+                category: a.category,
+                description: a.description,
+                basis: job.basis,
+                keywords: a.keywords,
+                seconds: started.elapsed().as_secs_f64(),
+            }),
             Err(prompt::ParseError::NoJson) => failure(vlm::Reason::BadReply("the model did not answer with the JSON object asked for".to_string())),
             Err(prompt::ParseError::NoKeywords) => failure(vlm::Reason::NoKeywords),
         },
@@ -557,11 +578,15 @@ fn finish_run(app: &mut LightcraftApp, st: &mut State) {
 /// at least one new keyword change; the batch is not committed when none do. Returns the photos
 /// and keywords written.
 fn apply(app: &mut LightcraftApp, st: &State) -> Result<(usize, usize), String> {
+    if st.loaded_gen.is_some_and(|generation| generation != app.session.library_generation()) {
+        return Err("Cancelled".into());
+    }
     let parent = st.run_parent.as_str();
     let mut ops: Vec<Op> = Vec::new();
     let mut added: Vec<String> = Vec::new();
     let mut photos = 0usize;
     let mut count = 0usize;
+    let mut descriptions = Vec::new();
     for r in &st.results {
         if st.excluded.contains(&r.id.0) {
             continue;
@@ -571,6 +596,20 @@ fn apply(app: &mut LightcraftApp, st: &State) -> Result<(usize, usize), String> 
             continue;
         }
         let Some(p) = app.session.catalog.photo(r.id) else { continue };
+        // Generation may finish after deletion or an edit. Do not apply stale keywords or
+        // resurrect a description from an image version the user no longer has selected.
+        if p.deleted || (r.basis != [0; 32] && crate::semantic_search::store::basis(p) != r.basis) {
+            continue;
+        }
+        if !r.description.is_empty() && r.basis != [0; 32] && crate::semantic_search::store::basis(p) == r.basis {
+            let guard_keywords = kept.iter().map(|kw| keywords::clean(&format!("{parent}|{}|{kw}", r.category))).collect();
+            descriptions.push(crate::semantic_search::store::Description {
+                id: r.id.0,
+                basis: r.basis,
+                description: r.description.clone(),
+                guard_keywords,
+            });
+        }
         let mut kws = p.meta.keywords.clone();
         let mut new = 0usize;
         for kw in kept {
@@ -590,6 +629,7 @@ fn apply(app: &mut LightcraftApp, st: &State) -> Result<(usize, usize), String> 
         ops.push(Op::SetMeta { id: r.id, meta: Box::new(Meta { keywords: kws, ..p.meta.clone() }) });
     }
     if ops.is_empty() {
+        crate::semantic_search::save_descriptions(app, descriptions)?;
         return Ok((0, 0));
     }
     let op = Op::Batch { ops };
@@ -602,6 +642,7 @@ fn apply(app: &mut LightcraftApp, st: &State) -> Result<(usize, usize), String> 
             Ok(Value::Null)
         })
         .map_err(|e| e.to_string())?;
+    crate::semantic_search::save_descriptions(app, descriptions)?;
     Ok((photos, count))
 }
 
@@ -1109,6 +1150,9 @@ fn photo_row_body(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, r: &Phot
         photo_thumb(app, ui, thumb, r.id.0, budget);
         ui.vertical(|ui| {
             ui.label(RichText::new(&r.name).font(t.font(10.5)).color(t.text));
+            if !r.description.is_empty() {
+                ui.label(RichText::new(&r.description).font(t.font(10.5)).color(t.text_dim));
+            }
             chips(ui, st, r.id.0, &r.category, &r.keywords, editable);
         });
     });

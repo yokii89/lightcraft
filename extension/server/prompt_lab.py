@@ -15,16 +15,9 @@ import argparse
 import time
 from pathlib import Path
 
-# The Rust side's prompt (prompt.rs), verbatim.
-CURRENT = (
-    "你是照片图库的自动打标助手。看这张照片，只输出一个 JSON 对象，不要解释：\n"
-    '{"category":"风景","keywords":["雪山","湖泊","日落"]}\n'
-    "\n"
-    "要求：\n"
-    "1. category 只能是以下之一：人物、动物、风景、建筑、食物、物体、文档、其他。\n"
-    "2. keywords 为 2 到 8 个简体中文词，具体、可检索；不要句子、不要相机参数、不要猜测真实姓名或具体地点。\n"
-    "3. 不要重复 category 或 keywords 中已有的词。"
-)
+from photo_prompt import photo_prompt
+
+CURRENT = photo_prompt()
 
 # Variants to try, in order.
 VARIANTS = [
@@ -91,7 +84,7 @@ def main() -> None:
             torch.cuda.synchronize()
             started = time.perf_counter()
             with torch.inference_mode():
-                out = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+                out = model.generate(**inputs, max_new_tokens=512, do_sample=False)
             torch.cuda.synchronize()
             gen_s = time.perf_counter() - started
             new_tokens = int(out.shape[-1] - inputs["input_ids"].shape[-1])

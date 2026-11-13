@@ -15,6 +15,7 @@ pub(crate) mod auto_keywords;
 pub(crate) mod geo_classify;
 pub(crate) mod hub;
 pub(crate) mod scope;
+pub mod semantic_search;
 pub(crate) mod tiles;
 pub(crate) mod ui;
 
@@ -25,6 +26,10 @@ pub fn pages() -> Vec<ExtensionPage> {
 
 /// Register every page with the running app.
 pub fn install(app: &mut LightcraftApp) {
+    app.register_extension_background(lightcraft_ui_egui::ext::ExtensionBackground {
+        observe: semantic_search::observe,
+        poll: semantic_search::poll,
+    });
     for page in pages() {
         app.register_extension_page(page);
     }

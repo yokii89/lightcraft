@@ -31,6 +31,7 @@ impl LightcraftApp {
             ui: UiState::default(),
             services,
             extension_pages: vec![],
+            extension_background: vec![],
             extension_page: None,
             renderer: render::Renderer::default(),
             perf: Perf::default(),
@@ -206,6 +207,7 @@ impl LightcraftApp {
     /// (offer a model's download, treat a cancel as one) instead of reading the message.
     pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
         if let Some(r) = menus::run_ui_command(self, id, &params) {
+            self.observe_extensions();
             if r.is_ok() {
                 docking::reveal_command(self, id)?;
             }
@@ -301,6 +303,7 @@ impl LightcraftApp {
             }
             Ok(_) => {}
         }
+        self.observe_extensions();
         r
     }
 
@@ -682,6 +685,7 @@ impl LightcraftApp {
         self.sync_theme(&ctx);
         self.ui_pass(&ctx);
         self.draw_window(ui);
+        self.observe_extensions();
         self.finish_ui_pass(&ctx);
     }
 }

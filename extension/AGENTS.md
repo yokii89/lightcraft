@@ -66,6 +66,9 @@ The root house rules apply in full, including:
 - `apps/lightcraft/Cargo.toml`, `apps/lightcraft/src/main.rs` — the host dependency and
   `lightcraft_extension::install(&mut app)`
 - `crates/ui-egui/src/ext.rs` — `ExtensionPage`, `register_extension_page`, the panel body
+- `crates/ui-egui/src/ext.rs`, `lib.rs`, `app.rs`, `app/frame.rs` — generic `ExtensionBackground`
+  registration, command/UI-pass observation and hidden-frame background polling; callbacks contain
+  no extension-specific logic
 - `crates/ui-egui/src/docking.rs`, `crates/ui-egui/src/state.rs` — `Panel::Extension`,
   `extension_open`, and the Extensions tab sharing the Tools tab group (`extension_tabbed` is a
   session-only flag for the one-time merge of an older two-column layout)

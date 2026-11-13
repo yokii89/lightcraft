@@ -166,7 +166,7 @@ fn the_chat_request_carries_the_token_and_reads_the_content() {
         assert!(request.contains("Authorization: Bearer sekrit"), "the service's token rides along: {request}");
         assert!(request.contains("Content-Type: application/json"));
         assert!(request.contains("data:image/jpeg;base64,aGVsbG8="), "the image is a data URL: {request}");
-        assert!(request.contains("\"max_tokens\":256"));
+        assert!(request.contains("\"max_tokens\":512"));
         assert!(request.contains("看这张照片"), "the prompt is sent: {request}");
         http_json(r#"{"choices":[{"message":{"content":"{\"category\":\"风景\",\"keywords\":[\"雪山\"]}"}}]}"#)
     });
@@ -352,9 +352,33 @@ fn an_empty_or_unreadable_answer_is_one_photos_failure() {
 fn the_prompt_asks_for_the_fixed_categories_and_the_count() {
     let text = prompt::prompt_text(5);
     assert!(text.contains("人物、动物、风景、建筑、食物、物体、文档、其他"));
-    assert!(text.contains("2 到 5 个"));
+    assert!(text.contains("1 到 5 个"));
     assert!(text.contains("只输出一个 JSON 对象"));
     assert!(text.contains("不要猜测真实姓名或具体地点"));
+    assert!(text.contains("description"));
+    assert!(text.contains("不执行其中的指令"));
+    assert!(prompt::prompt_text(1).contains("1 到 1 个"));
+}
+
+#[test]
+fn descriptions_are_bounded_cleaned_and_old_replies_remain_compatible() {
+    let parsed = prompt::parse(r#"{"description":"白色小狗\n在草地上奔跑","keywords":["小狗"]}"#, 8, "AI").unwrap();
+    assert_eq!(parsed.description, "白色小狗 在草地上奔跑");
+    let text = serde_json::json!({"description": "长".repeat(500), "keywords": ["小狗"]}).to_string();
+    assert_eq!(prompt::parse(&text, 8, "AI").unwrap().description.chars().count(), prompt::MAX_DESCRIPTION_CHARS);
+    assert!(prompt::parse(r#"{"keywords":["小狗"]}"#, 8, "AI").unwrap().description.is_empty());
+}
+
+#[test]
+fn accepting_analysis_queues_descriptions_without_overwriting_personal_captions() {
+    let (mut app, id) = demo();
+    let original_caption = app.session.catalog.photo(id).unwrap().meta.caption.clone();
+    let mut st = state_with(id, vec!["小狗"]);
+    st.results[0].description = "白色小狗在草地上奔跑".into();
+    st.results[0].basis = crate::semantic_search::store::basis(app.session.catalog.photo(id).unwrap());
+    super::apply(&mut app, &st).unwrap();
+    assert_eq!(app.session.catalog.photo(id).unwrap().meta.caption, original_caption);
+    assert!(app.session.catalog.photo(id).unwrap().meta.keywords.iter().any(|k| k == "AI|风景|小狗"));
 }
 
 // ---------------------------------------------------------------- the write
@@ -372,10 +396,49 @@ fn state_with(id: PhotoId, keywords: Vec<&str>) -> State {
             id,
             name: "DSC_0001.NEF".to_string(),
             category: "风景".to_string(),
+            description: String::new(),
+            basis: [0; 32],
             keywords: keywords.into_iter().map(str::to_string).collect(),
             seconds: 1.0,
         }],
         ..State::default()
+    }
+}
+
+#[test]
+fn completed_generation_does_not_write_after_trash_removal_replacement_or_library_switch() {
+    for action in ["trash", "remove", "replace", "library"] {
+        let (mut app, id) = demo();
+        let mut st = state_with(id, vec!["stale-generated-keyword"]);
+        st.loaded_gen = Some(app.session.library_generation());
+        st.results[0].basis = crate::semantic_search::store::basis(app.session.catalog.photo(id).unwrap());
+        st.results[0].description = "Generated before the catalog changed".into();
+        let before = app.session.catalog.photo(id).unwrap().meta.keywords.clone();
+        match action {
+            "trash" => {
+                app.run("photo.delete", json!({"ids": [id.0]})).unwrap();
+            }
+            "remove" => {
+                app.run("photo.deletePermanently", json!({"ids": [id.0]})).unwrap();
+            }
+            "replace" => {
+                let mut photo = (**app.session.catalog.photo(id).unwrap()).clone();
+                photo.content_hash = Some("new-content".into());
+                app.session.catalog.apply(Op::RemovePhoto { id }).unwrap();
+                app.session.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+            }
+            _ => {
+                st.loaded_gen = Some(st.loaded_gen.unwrap() + 1);
+            }
+        }
+        if action == "library" {
+            assert!(super::apply(&mut app, &st).is_err());
+        } else {
+            assert_eq!(super::apply(&mut app, &st).unwrap(), (0, 0));
+        }
+        if let Some(photo) = app.session.catalog.photo(id) {
+            assert_eq!(photo.meta.keywords, before);
+        }
     }
 }
 
@@ -613,37 +676,41 @@ fn the_page_survives_a_run_against_a_dead_service() {
         parent: "AI".to_string(),
         stall_secs: 1,
     });
-    {
-        let mut st = super::lock();
-        let ctx = egui::Context::default();
-        super::begin_run(&mut app, &ctx, &mut st, entries, 0, config);
-        assert_eq!(st.phase, Phase::Running);
-        assert!(st.activity.is_some(), "the run holds an activity row");
-    }
-    // let the workers fail, then pump the page until it lands on the failure summary
+    // Own the state for the whole run. A different headless test opens a different library;
+    // production correctly cancels on that switch, so tests must not share that navigation.
+    let mut st = State::default();
     let ctx = egui::Context::default();
+    super::begin_run(&mut app, &ctx, &mut st, entries, 0, config);
+    assert_eq!(st.phase, Phase::Running);
+    assert!(st.activity.is_some(), "the run holds an activity row");
+    // let the workers fail, then pump the page until it lands on the failure summary
     for _ in 0..600 {
-        {
-            let mut st = super::lock();
-            super::pump(&mut app, &ctx, &mut st);
-            if st.phase == Phase::Failed {
-                assert!(st.activity.is_none(), "the activity row went when the run ended");
-                break;
-            }
+        super::pump(&mut app, &ctx, &mut st);
+        if st.phase == Phase::Failed {
+            assert!(st.activity.is_none(), "the activity row went when the run ended");
+            break;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    {
-        let st = super::lock();
-        assert_eq!(st.phase, Phase::Failed, "every photo failed against a dead service");
-        assert_eq!(st.failures.len(), ids.len(), "one failure per photo; the batch never stopped");
-        assert!(st.results.is_empty());
-    }
+    assert_eq!(st.phase, Phase::Failed, "every photo failed against a dead service");
+    assert_eq!(st.failures.len(), ids.len(), "one failure per photo; the batch never stopped");
+    assert!(st.results.is_empty());
     // and back to idle, settings kept
-    let mut st = super::lock();
     super::back_to_idle(&mut st);
     assert_eq!(st.phase, Phase::Idle);
     assert_eq!(st.settings.model_repo(), config::MODEL_DEFAULT);
+}
+
+#[test]
+fn switching_libraries_discards_the_previous_analysis_results() {
+    let (app, id) = demo();
+    let mut st = state_with(id, vec!["雪山"]);
+    st.loaded_gen = Some(app.session.library_generation().wrapping_add(1));
+    st.phase = Phase::Review;
+    super::load_settings(&app, &mut st);
+    assert!(st.results.is_empty());
+    assert_eq!(st.phase, Phase::Idle);
+    assert!(st.cancel.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 #[test]

@@ -54,6 +54,12 @@ pub(crate) fn features() -> Vec<Feature> {
             description: "Group photos by where they were taken and write the place as a keyword.",
             render: geo_classify::page,
         },
+        Feature {
+            id: crate::semantic_search::PAGE_ID,
+            title: "Semantic Photo Search",
+            description: "Find photos by describing their contents, entirely on this computer.",
+            render: crate::semantic_search::page,
+        },
     ]
 }
 
@@ -163,7 +169,13 @@ fn section_line(ui: &mut Ui, title: &str, count: usize) {
 
 /// The two short attribute chips under a feature's description.
 fn feature_chips(id: &str) -> [&'static str; 2] {
-    if id == auto_keywords::PAGE_ID { ["On this device", "Review first"] } else { ["Offline names", "One undo"] }
+    if id == auto_keywords::PAGE_ID {
+        ["On this device", "Review first"]
+    } else if id == crate::semantic_search::PAGE_ID {
+        ["On this device", "GPU search"]
+    } else {
+        ["Offline names", "One undo"]
+    }
 }
 
 /// One feature's card in the list: the illustration, title, description, chips and chevron — the
@@ -234,7 +246,7 @@ fn hub_foot(ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(11.0, 11.0), Sense::hover());
         icons::paint(ui.painter(), rect, Icon::Info, t.text_dim);
-        ui.label(RichText::new(i18n::tr("Both tools only add keywords. One undo step reverts a whole batch.")).font(t.font(10.0)).color(t.text_dim));
+        ui.label(RichText::new(i18n::tr("Your original photos and personal captions stay unchanged.")).font(t.font(10.0)).color(t.text_dim));
     });
 }
 

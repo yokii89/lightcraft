@@ -157,6 +157,7 @@ pub struct LightcraftApp {
     /// Pages the desktop host registered for the Extensions panel (empty in the web app and in
     /// tests without a host).
     pub extension_pages: Vec<ext::ExtensionPage>,
+    pub extension_background: Vec<ext::ExtensionBackground>,
     /// The Extensions page open; `None` shows the first registered page.
     pub extension_page: Option<&'static str>,
     pub renderer: render::Renderer,

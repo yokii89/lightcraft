@@ -7,6 +7,15 @@
 
 use crate::LightcraftApp;
 
+/// Host-owned background work, independent of whether an extension page is visible.
+#[derive(Clone, Copy)]
+pub struct ExtensionBackground {
+    /// Observe catalog/library changes after commands and UI passes; must not perform I/O.
+    pub observe: fn(&LightcraftApp),
+    /// Drain results and schedule background work, including during hidden logic ticks.
+    pub poll: fn(&mut LightcraftApp, &egui::Context),
+}
+
 /// One page of the Extensions panel. `render` draws into the panel's [`egui::Ui`], exactly like a
 /// built-in panel body.
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +28,22 @@ pub struct ExtensionPage {
 }
 
 impl LightcraftApp {
+    pub fn register_extension_background(&mut self, background: ExtensionBackground) {
+        self.extension_background.push(background);
+    }
+
+    pub(crate) fn observe_extensions(&self) {
+        for background in &self.extension_background {
+            (background.observe)(self);
+        }
+    }
+
+    pub(crate) fn poll_extensions(&mut self, ctx: &egui::Context) {
+        for background in self.extension_background.clone() {
+            (background.poll)(self, ctx);
+        }
+    }
+
     /// Add a page to the Extensions panel. Pages keep their registration order; the first one is
     /// shown until the user picks another tab.
     pub fn register_extension_page(&mut self, page: ExtensionPage) {
@@ -70,6 +95,29 @@ mod tests {
         app.register_extension_page(ExtensionPage { id: "two", title: "Two", render: noop });
         assert_eq!(app.extension_pages.iter().map(|page| page.id).collect::<Vec<_>>(), ["one", "two"]);
         assert_eq!(app.extension_page, None, "the first page is shown until the user picks one");
+    }
+
+    #[test]
+    fn background_callbacks_observe_commands_and_run_with_no_extension_panel() {
+        static OBSERVED: AtomicUsize = AtomicUsize::new(0);
+        static POLLED: AtomicUsize = AtomicUsize::new(0);
+        fn observe(app: &LightcraftApp) {
+            OBSERVED.store(app.session.catalog.photos().filter(|p| p.deleted).count(), Ordering::Relaxed);
+        }
+        fn poll(_: &mut LightcraftApp, _: &egui::Context) {
+            POLLED.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default());
+        app.register_extension_background(ExtensionBackground { observe, poll });
+        let id = app.session.catalog.photos().next().unwrap().id;
+        app.run("photo.delete", serde_json::json!({"ids": [id.0]})).unwrap();
+        assert_eq!(OBSERVED.load(Ordering::Relaxed), 1, "commands publish catalog state before returning");
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().minimized = Some(true);
+        let _ = ctx.run_logic(&input, |ctx| app.logic(ctx));
+        assert!(app.extension_pages.is_empty());
+        assert!(POLLED.load(Ordering::Relaxed) > 0, "hidden logic ticks drive background work");
     }
 
     #[test]

@@ -404,7 +404,7 @@ pub fn analyze(
             { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{image_b64}") } },
         ]}],
         "temperature": 0.0,
-        "max_tokens": 256,
+        "max_tokens": 512,
         "stream": false,
     })
     .to_string();

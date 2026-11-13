@@ -22,17 +22,9 @@ import random
 import time
 from pathlib import Path
 
-# The real prompt the Rust side sends (extension/src/auto_keywords/prompt.rs),
-# with the default 8 keywords. Kept in sync by hand — a bench-only copy.
-PROMPT = (
-    "你是照片图库的自动打标助手。看这张照片，只输出一个 JSON 对象，不要解释：\n"
-    '{"category":"风景","keywords":["雪山","湖泊","日落"]}\n'
-    "\n"
-    "要求：\n"
-    "1. category 只能是以下之一：人物、动物、风景、建筑、食物、物体、文档、其他。\n"
-    "2. keywords 为 2 到 8 个简体中文词，具体、可检索；不要句子、不要相机参数、不要猜测真实姓名或具体地点。\n"
-    "3. 不要重复 category 或 keywords 中已有的词。"
-)
+from photo_prompt import photo_prompt
+
+PROMPT = photo_prompt()
 
 IMAGE_TOKEN_ID = 151655  # config.json's image_token_id
 # The vision-input area cap server.py applies (size["longest_edge"]); mirrored here so the
@@ -83,7 +75,7 @@ def load_photo(path: Path, long_edge: int):
 
 
 def load(model_arg: str, device_arg: str, attn: str):
-    """The exact load path of server.py (Service.load): dtype auto on the GPU,
+    """The exact load path of server.py (Service.load): BF16 on the GPU,
     float32 on the CPU, SDPA attention (or what --attn asks), TF32 matmuls."""
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -97,7 +89,7 @@ def load(model_arg: str, device_arg: str, attn: str):
     local = Path(__file__).resolve().parent / "models" / model_arg
     if (local / "config.json").is_file():
         source = str(local)
-    dtype = "float32" if device == "cpu" else "auto"
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
     started = time.time()
     print(f"loading {source} on {device} ({dtype}, {attn}) …", flush=True)
     processor = AutoProcessor.from_pretrained(source)
@@ -243,7 +235,7 @@ def main() -> None:
     parser.add_argument("--num", type=int, default=5, help="photos per size")
     parser.add_argument("--sizes", default="1024,768,640", help="send long edges to try, comma separated")
     parser.add_argument("--reps", type=int, default=1, help="timed runs per photo")
-    parser.add_argument("--max-tokens", type=int, default=256, help="the decode cap to test (the Rust side sends 256)")
+    parser.add_argument("--max-tokens", type=int, default=512, help="the decode cap to test (the Rust side sends 512)")
     parser.add_argument("--batch", default="", help="batching experiment: batch sizes to try, comma separated (e.g. 2,4)")
     parser.add_argument("--probe", action="store_true", help="per-token timing probe on the first photo of each size")
     parser.add_argument("--text-only", action="store_true", help="also time one text-only ask per size")
