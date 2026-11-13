@@ -2695,5 +2695,14 @@
   "Start the app with --control 7980 (or LIGHTCRAFT_CONTROL_PORT), then lightcraft-cli mcp --connect attaches one to it.": "先以 --control 7980 (或 LIGHTCRAFT_CONTROL_PORT) 启动应用，lightcraft-cli mcp --connect 即可将一个智能体接入其中。",
   "Welcome": "欢迎",
   "Next": "下一步",
-  "Get Started": "开始使用"
+  "Get Started": "开始使用",
+  "All cities": "所有城市",
+  "All countries": "所有国家",
+  "Map filters": "地图筛选",
+  "No places match the map filters.": "没有符合地图筛选条件的地点。",
+  "Search places": "搜索地点",
+  "Show current map photos": "显示当前地图范围照片",
+  "{n} photos in the current map area": "当前地图范围内照片：{n} 张",
+  "Full screen map": "全屏地图",
+  "Exit full screen map": "退出全屏地图"
 }

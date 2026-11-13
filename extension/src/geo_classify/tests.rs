@@ -3,7 +3,7 @@
 //! persistent album's store and its incremental sync (design 05), the map's geometry and points,
 //! and headless renders/interactions of the album and review pages.
 
-use egui::vec2;
+use egui::{Rect, pos2, vec2};
 use lightcraft_catalog::{Meta, Op, PhotoId};
 use lightcraft_engine::Session;
 use lightcraft_geocode::GeoNames;
@@ -184,7 +184,7 @@ fn a_touched_pass_queues_only_the_changed_photos() {
 #[test]
 fn another_library_starts_with_an_empty_album() {
     let (mut app, a, _) = demo();
-    let mut st = State { parent: "地点".to_string(), loaded_gen: Some(app.session.library_generation()), ..State::default() };
+    let mut st = State { parent: "地点".to_string(), loaded_gen: Some(app.session.library_generation()), map_fullscreen: true, ..State::default() };
     st.sync.queue.push(a);
     st.store.insert(store::Entry {
         id: a.0,
@@ -203,6 +203,7 @@ fn another_library_starts_with_an_empty_album() {
     assert_eq!(st.parent, super::PARENT_DEFAULT, "an empty library does not inherit the previous parent's keyword");
     assert!(!st.sync.queue.contains(&a), "queued photo ids from the previous library are discarded");
     assert_eq!(st.phase, super::Phase::Idle, "the new library opens on its album page");
+    assert!(!st.map_fullscreen, "a new library exits the old library's fullscreen map");
     assert_eq!(st.loaded_gen, Some(app.session.library_generation()));
 }
 
@@ -388,7 +389,199 @@ fn chinese_groups_become_map_points_and_foreign_ones_do_not() {
     assert_eq!(p.photos.len(), 2, "the thumbnails come from the group's photos");
 }
 
+#[test]
+fn album_map_filters_keep_the_gallery_order_and_match_place_names() {
+    let places = vec![
+        place_at(1, "lake.jpg", "中国", "杭州", "CN", 30.2, 120.1),
+        place_at(2, "temple.jpg", "中国", "杭州", "CN", 30.3, 120.2),
+        place_at(3, "tower.jpg", "中国", "北京", "CN", 39.9, 116.4),
+        place_at(4, "tokyo.jpg", "日本", "东京", "JP", 35.7, 139.7),
+    ];
+    let all = groups("地点", &places);
+    let visible = [PhotoId(2), PhotoId(1), PhotoId(3), PhotoId(4)];
+    let points = map::map_points_filtered(&all, Some(&visible), "中国", "杭州", "杭州");
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].label, "杭州");
+    assert_eq!(points[0].photos.iter().map(|photo| photo.0).collect::<Vec<_>>(), vec![PhotoId(2), PhotoId(1)]);
+
+    let all_countries = map::map_points_filtered(&all, Some(&visible), "日本", "", "");
+    assert_eq!(all_countries.len(), 1);
+    assert_eq!(all_countries[0].photos[0].0, PhotoId(4));
+}
+
+#[test]
+fn album_map_viewport_returns_only_photos_inside_the_map() {
+    let places = vec![place_at(1, "near.jpg", "中国", "杭州", "CN", 30.0, 120.0), place_at(2, "far.jpg", "中国", "杭州", "CN", 40.0, 130.0)];
+    let points = map::map_points_filtered(&groups("地点", &places), None, "", "", "");
+    let view = MapView { c_lon: 120.0, c_lat: 30.0, span_lon: 2.0 };
+    let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 300.0));
+    assert_eq!(map::photo_ids_in_view(&points, &view, rect), vec![PhotoId(1)]);
+}
+
 // ---------------------------------------------------------------- the page
+
+fn album_state(app: &LightcraftApp, places: Vec<PhotoPlace>) {
+    with_review_state(app, places, "地点");
+    let mut st = lock();
+    st.phase = super::Phase::Idle;
+    st.tiles_off = true;
+}
+
+fn page_frame(view: &mut lightcraft_ui_egui::headless::HeadlessView, app: &mut LightcraftApp, size: egui::Vec2, events: Vec<egui::Event>) {
+    let time = view.frames() as f64 / 10.0;
+    lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    let _ = view.run(lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1.0, time, events), |ui| page(app, ui));
+}
+
+fn click_page_widget(view: &mut lightcraft_ui_egui::headless::HeadlessView, app: &mut LightcraftApp, size: egui::Vec2, id: &str) {
+    page_frame(view, app, size, vec![]);
+    let at = lightcraft_ui_egui::widgets::take_registry(&view.ctx)
+        .into_iter()
+        .find(|(widget, _)| widget == id)
+        .unwrap_or_else(|| panic!("missing {id}"))
+        .1
+        .center();
+    page_frame(view, app, size, vec![egui::Event::PointerMoved(at)]);
+    for pressed in [true, false] {
+        page_frame(
+            view,
+            app,
+            size,
+            vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }],
+        );
+    }
+    page_frame(view, app, size, vec![]);
+    page_frame(view, app, size, vec![]);
+}
+
+fn escape_event() -> egui::Event {
+    egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+}
+
+#[test]
+fn fullscreen_map_expands_resizes_and_keeps_the_album_camera_and_filters() {
+    let _page = super::page_test_lock();
+    let (mut app, a, b) = demo();
+    album_state(&app, vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16), place_at(b.0, "b.jpg", "中国", "北京", "CN", 39.9, 116.4)]);
+    let camera = MapView { c_lon: 120.16, c_lat: 30.27, span_lon: 12.0 };
+    {
+        let mut st = lock();
+        st.map = camera;
+        st.map_country = "中国".to_string();
+        st.map_city = "杭州".to_string();
+        st.map_search = "杭州".to_string();
+    }
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let size = vec2(1200.0, 1100.0);
+    page_frame(&mut view, &mut app, size, vec![]);
+    click_page_widget(&mut view, &mut app, size, "geo:map:enterFullscreen");
+    assert!(lock().map_fullscreen, "the album button opens the fullscreen map");
+    let registry = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    let rect = registry.iter().find(|(id, _)| id == "geo:map").expect("the fullscreen map").1;
+    assert!(rect.width() > 1150.0 && rect.height() > 850.0, "fills the window without the old height caps: {rect:?}");
+    assert!(rect.max.x <= size.x && rect.max.y <= size.y + 1.0, "the map stays inside the window: {rect:?}");
+    assert!(registry.iter().any(|(id, _)| id == "geo:map:country"));
+    assert!(registry.iter().any(|(id, _)| id == "geo:map:viewport"));
+    assert!(!registry.iter().any(|(id, _)| id == "geo:start"), "the underlying page isn't rendered twice");
+    assert_eq!(lock().map_viewport_ids, vec![a], "fullscreen keeps the album filters");
+
+    let small = vec2(820.0, 620.0);
+    page_frame(&mut view, &mut app, small, vec![]);
+    page_frame(&mut view, &mut app, small, vec![]);
+    let registry = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    let rect = registry.iter().find(|(id, _)| id == "geo:map").unwrap().1;
+    assert!(rect.width() > 790.0 && rect.max.x <= small.x && rect.max.y <= small.y + 1.0, "resized map: {rect:?}");
+    click_page_widget(&mut view, &mut app, small, "geo:map:exitFullscreen");
+    let st = lock();
+    assert!(!st.map_fullscreen);
+    assert_eq!(st.map, camera);
+    assert_eq!((&*st.map_country, &*st.map_city, &*st.map_search), ("中国", "杭州", "杭州"));
+    drop(st);
+    *lock() = State::default();
+}
+
+#[test]
+fn empty_fullscreen_map_can_be_navigated_and_exited_with_escape() {
+    let _page = super::page_test_lock();
+    let (mut app, _, _) = demo();
+    album_state(&app, Vec::new());
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let size = vec2(1000.0, 800.0);
+    page_frame(&mut view, &mut app, size, vec![]);
+    click_page_widget(&mut view, &mut app, size, "geo:map:enterFullscreen");
+    assert!(lock().map_fullscreen);
+    assert!(view.painted_text().iter().any(|text| text.contains("No places match")));
+    let before = lock().map.span_lon;
+    click_page_widget(&mut view, &mut app, size, "geo:map:zoomin");
+    assert!(lock().map.span_lon < before, "floating controls remain clickable above the modal");
+    page_frame(&mut view, &mut app, size, vec![escape_event()]);
+    assert!(!lock().map_fullscreen, "Escape exits even when the album is empty");
+    *lock() = State::default();
+}
+
+#[test]
+fn clicking_a_fullscreen_photo_exits_to_its_detail_view() {
+    let _page = super::page_test_lock();
+    let (mut app, a, _) = demo();
+    album_state(&app, vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16)]);
+    {
+        let mut st = lock();
+        st.map_fullscreen = true;
+        st.map = MapView { c_lon: 120.16, c_lat: 30.27, span_lon: 4.0 };
+    }
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let size = vec2(1000.0, 800.0);
+    for _ in 0..3 {
+        page_frame(&mut view, &mut app, size, vec![]);
+    }
+    click_page_widget(&mut view, &mut app, size, &format!("geo:map:photo:{}", a.0));
+    assert!(!lock().map_fullscreen);
+    assert_eq!(app.session.active(), Some(a));
+    assert_eq!(app.ui.view, lightcraft_ui_egui::state::ViewMode::Detail);
+    *lock() = State::default();
+}
+
+#[test]
+fn fullscreen_map_owns_host_keyboard_and_pointer_input() {
+    let _page = super::page_test_lock();
+    let (mut app, a, _) = demo();
+    album_state(&app, vec![place_at(a.0, "a.jpg", "中国", "杭州", "CN", 30.27, 120.16)]);
+    app.register_extension_page(lightcraft_ui_egui::ext::ExtensionPage { id: "geo-test", title: "Map album", render: page });
+    app.run("view.extensionPage", Value::Null).unwrap();
+    app.run("library.select", serde_json::json!({"ids": [a.0]})).unwrap();
+    app.run("view.detail", Value::Null).unwrap();
+    let mut host = lightcraft_ui_egui::headless::Headless::new(app, [1200.0, 900.0], 1.0);
+    let timeout = std::time::Duration::from_secs(20);
+    host.settle(timeout);
+    let reply = host.request("ui.clickWidget", serde_json::json!({"id": "geo:map:enterFullscreen"}), timeout);
+    assert_eq!(reply["ok"], true, "enter: {reply}");
+    for _ in 0..3 {
+        host.step();
+    }
+    assert!(lock().map_fullscreen);
+    let before = lock().map.span_lon;
+    let reply = host.request("ui.clickWidget", serde_json::json!({"id": "geo:map:zoomin"}), timeout);
+    assert_eq!(reply["ok"], true, "zoom: {reply}");
+    assert!(lock().map.span_lon < before);
+    let ids = host.app.session.selection.ids.clone();
+    let rating = host.app.session.catalog.photo(a).unwrap().rating;
+    host.request("ui.key", serde_json::json!({"key": "right"}), timeout);
+    host.request("ui.key", serde_json::json!({"key": "5"}), timeout);
+    assert_eq!(host.app.session.selection.ids, ids, "keys do not navigate the covered library");
+    assert_eq!(host.app.session.catalog.photo(a).unwrap().rating, rating, "keys do not rate a covered photo");
+    let reply = host.request("ui.clickWidget", serde_json::json!({"id": "geo:map:search"}), timeout);
+    assert_eq!(reply["ok"], true, "search: {reply}");
+    host.request("ui.text", serde_json::json!({"text": "missing place"}), timeout);
+    assert_eq!(lock().map_search, "missing place");
+    host.request("ui.key", serde_json::json!({"key": "escape"}), timeout);
+    assert!(lock().map_fullscreen, "the first Escape cancels a text edit");
+    assert!(lock().map_search.is_empty(), "the search edit is restored");
+    let reply = host.request("ui.key", serde_json::json!({"key": "escape"}), timeout);
+    assert_eq!(reply["ok"], true, "escape: {reply}");
+    assert!(!lock().map_fullscreen);
+    assert_eq!(host.app.ui.view, lightcraft_ui_egui::state::ViewMode::Detail, "Escape only exits the map");
+    *lock() = State::default();
+}
 
 /// Install a Review state over the demo app's *injected* places: the page state looks exactly as
 /// it does after the first pump (library generation recorded, sync baseline set), and the
@@ -474,6 +667,9 @@ fn the_album_card_renders_the_stored_album_headless() {
     let registered = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
     assert!(registered.iter().any(|(id, _)| id == "geo:map"), "the album map is registered for automation");
     assert!(registered.iter().any(|(id, _)| id == "geo:map:bubble:0"), "the album's places are on the map");
+    assert!(registered.iter().any(|(id, _)| id == "geo:map:country"), "the album map exposes a country filter");
+    assert!(registered.iter().any(|(id, _)| id == "geo:map:city"), "the album map exposes a city filter");
+    assert!(registered.iter().any(|(id, _)| id == "geo:map:viewport"), "the album map exposes its current viewport action");
     assert!(registered.iter().any(|(id, _)| id == "geo:start"), "the write action is in the sticky footer");
     *lock() = State::default();
 }

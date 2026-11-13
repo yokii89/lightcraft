@@ -11,7 +11,7 @@
 //! boundaries are original simplified vectors (our own work, recorded in
 //! `assets/ATTRIBUTION.md`); the on-map note stays until standard boundary data replaces them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use egui::{
@@ -23,6 +23,7 @@ use lightcraft_ui_egui::panels::grid::request_thumb;
 use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::{i18n, icons, widgets};
 
+use lightcraft_catalog::PhotoId;
 use lightcraft_meta::{TrackPoint, Tracklog};
 
 use super::{Group, MAX_DRAWN_TRACK_POINTS, State, TrackOverlay};
@@ -374,29 +375,77 @@ pub(crate) struct MapPoint {
     pub off: bool,
 }
 
-/// The Chinese groups of the review as map points; groups abroad stay off the map.
+/// The groups of the review as map points.
 pub(crate) fn map_points(all: &[Group]) -> Vec<MapPoint> {
+    let china: Vec<Group> = all.iter().filter(|g| g.iso.eq_ignore_ascii_case("CN")).cloned().collect();
+    map_points_filtered(&china, None, "", "", "")
+}
+
+/// Album map points after the current library view and the map's place filters have been applied.
+/// `visible` is already in the gallery's sort order, so thumbnails retain the same order as the
+/// library grid. An empty `visible` means the caller is rendering the review map, which has its
+/// own pending-photo scope.
+pub(crate) fn map_points_filtered(all: &[Group], visible: Option<&[PhotoId]>, country: &str, city: &str, search: &str) -> Vec<MapPoint> {
+    let visible_set: HashSet<PhotoId> = visible.into_iter().flatten().copied().collect();
+    let order: HashMap<PhotoId, usize> = visible.into_iter().flatten().enumerate().map(|(i, id)| (*id, i)).collect();
+    let country = country.trim().to_lowercase();
+    let city = city.trim().to_lowercase();
+    let search = search.trim().to_lowercase();
+    let matches = |g: &Group| {
+        (country.is_empty() || g.country.to_lowercase() == country)
+            && (city.is_empty() || g.city.to_lowercase() == city)
+            && (search.is_empty()
+                || g.country.to_lowercase().contains(&search)
+                || g.city.to_lowercase().contains(&search)
+                || g.path.to_lowercase().contains(&search))
+    };
     let mut points = Vec::new();
     for g in all {
-        if !g.iso.eq_ignore_ascii_case("CN") || g.places.is_empty() {
+        if g.places.is_empty() {
             continue;
         }
+        if !matches(g) {
+            continue;
+        }
+        let mut places: Vec<&super::PhotoPlace> =
+            visible.map_or_else(|| g.places.iter().collect(), |_| g.places.iter().filter(|p| visible_set.contains(&p.id)).collect());
+        if places.is_empty() {
+            continue;
+        }
+        places.sort_by_key(|p| order.get(&p.id).copied().unwrap_or(usize::MAX));
         let (mut lat_sum, mut lon_sum) = (0.0, 0.0);
-        for p in &g.places {
+        for p in &places {
             lat_sum += p.lat;
             lon_sum += p.lon;
         }
-        let n = g.places.len() as f64;
+        let n = places.len() as f64;
         points.push(MapPoint {
             path: g.path.clone(),
             label: if g.city.is_empty() { g.country.clone() } else { g.city.clone() },
-            count: g.places.len(),
+            count: places.len(),
             center: (lat_sum / n, lon_sum / n),
-            photos: g.places.iter().map(|p| (p.id, p.name.clone(), p.lat, p.lon, p.distance)).collect(),
+            photos: places.iter().map(|p| (p.id, p.name.clone(), p.lat, p.lon, p.distance)).collect(),
             off: false,
         });
     }
+    if visible.is_some() {
+        points.sort_by_key(|p| p.photos.iter().filter_map(|photo| order.get(&photo.0)).min().copied().unwrap_or(usize::MAX));
+    }
     points
+}
+
+/// IDs of album photos whose GPS positions fall inside the rendered map rectangle.
+pub(crate) fn photo_ids_in_view(points: &[MapPoint], view: &MapView, rect: Rect) -> Vec<PhotoId> {
+    let cam = Cam::new(view, rect);
+    let mut ids = Vec::new();
+    for point in points {
+        for (id, _, lat, lon, _) in &point.photos {
+            if rect.contains(cam.to_px(*lat, *lon)) {
+                ids.push(*id);
+            }
+        }
+    }
+    ids
 }
 
 fn bubble_radius(count: usize) -> f32 {
@@ -461,10 +510,18 @@ pub(crate) fn draw_map(
 ) {
     let t = Tokens::get(ui.ctx());
     let dark = lightcraft_ui_egui::theme::current(ui.ctx()).unwrap_or_default().is_dark();
-    let mut points = map_points(all);
-    if points.is_empty() && tracks.is_empty() {
+    let visible = if fixed_height.is_some() { Some(app.session.visible_cloned()) } else { None };
+    if fixed_height.is_some() {
+        st.map_viewport_ids.clear();
+    }
+    let mut points = if fixed_height.is_some() {
+        map_points_filtered(all, visible.as_deref(), &st.map_country, &st.map_city, &st.map_search)
+    } else {
+        map_points(all)
+    };
+    if points.is_empty() && tracks.is_empty() && !st.map_fullscreen {
         ui.add_space(6.0);
-        ui.label(RichText::new(i18n::tr("No places in China to show on the map.")).font(t.font(11.0)).color(t.text_dim));
+        ui.label(RichText::new(i18n::tr("No places match the map filters.")).font(t.font(11.0)).color(t.text_dim));
         return;
     }
     for p in &mut points {
@@ -476,8 +533,17 @@ pub(crate) fn draw_map(
     let c = map_colors(dark, t);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, c.sea);
+    // Keep floating controls above the fullscreen modal as well as the docked map.
+    if ui.layer_id().order == egui::Order::Foreground {
+        for id in ["geo-map-online", "geo-map-popup", "geo-map-chips", "geo-map-zoom"] {
+            ui.ctx().set_sublayer(ui.layer_id(), egui::LayerId::new(egui::Order::Foreground, Id::unique(id)));
+        }
+    }
 
     handle_input(ui, st, &base, rect);
+    if let Some(visible) = visible {
+        st.map_viewport_ids = photo_ids_in_view(&points, &st.map, rect).into_iter().filter(|id| visible.contains(id)).collect();
+    }
     tiles::pump(ui.ctx());
     // the view may have moved with the input: build the camera fresh
     let t = Tokens::get(ui.ctx());
@@ -505,6 +571,9 @@ pub(crate) fn draw_map(
     draw_popup(app, st, &points, &mut cx, rect);
     draw_controls(st, &mut *cx.ui, rect);
     draw_online_toggle(st, &mut *cx.ui, rect);
+    if points.is_empty() && tracks.is_empty() {
+        cx.painter.text(rect.center(), Align2::CENTER_CENTER, i18n::tr("No places match the map filters."), t.font(12.0), t.text);
+    }
 }
 
 /// Wheel zoom around the pointer, double-click zoom, and the grab cursors.
@@ -822,7 +891,7 @@ fn draw_thumbs(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, poin
                     cx.painter.rect_filled(rect, 2.0, cx.t.skeleton);
                 }
             }
-            let sel = st.photo_sel == Some(*id);
+            let sel = st.photo_sel == Some(*id) || app.session.selection.contains(*id);
             cx.painter.rect_stroke(
                 rect,
                 2.0,
@@ -837,6 +906,7 @@ fn draw_thumbs(app: &mut lightcraft_ui_egui::LightcraftApp, st: &mut State, poin
                 let _ = app.run("library.select", serde_json::json!({ "ids": [id.0] }));
                 let _ = app.run("view.detail", serde_json::json!({}));
                 st.photo_sel = Some(*id);
+                st.map_fullscreen = false;
                 hit = true;
             }
             if resp.dragged_by(PointerButton::Primary) {

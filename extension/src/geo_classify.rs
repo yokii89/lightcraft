@@ -232,7 +232,16 @@ struct State {
     groups_off: HashSet<String>,
     /// The map's view and what is selected on it.
     map: map::MapView,
+    /// Expand the album map over the app window without replacing its camera or filters.
+    map_fullscreen: bool,
     map_sel: Option<String>,
+    /// Filters owned by the album map. The gallery filter remains authoritative for the visible
+    /// photo set; these narrow the map without unexpectedly replacing the user's filter bar.
+    map_country: String,
+    map_city: String,
+    map_search: String,
+    /// Updated while the album map is drawn, then consumed by the range action below it.
+    map_viewport_ids: Vec<PhotoId>,
     /// The photo shown in the detail view from a thumbnail click (for the ring).
     photo_sel: Option<PhotoId>,
     /// The online AMap basemap is switched off (the offline schematic map shows instead).
@@ -299,7 +308,13 @@ pub(crate) fn page_test_lock() -> MutexGuard<'static, ()> {
 pub(crate) fn page(app: &mut LightcraftApp, ui: &mut Ui) {
     pump(app, ui.ctx(), &mut lock());
     widgets_page(ui);
-    draw(app, ui, &mut lock());
+    let mut st = lock();
+    if st.map_fullscreen {
+        sync_snapshot(app, &mut st);
+        draw_fullscreen_map(app, ui.ctx(), &mut st);
+    } else {
+        draw(app, ui, &mut st);
+    }
 }
 
 fn widgets_page(ui: &mut Ui) {
@@ -381,7 +396,12 @@ fn pump_album(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
         }
         st.phase = Phase::Idle;
         st.map = map::MapView::default();
+        st.map_fullscreen = false;
         st.map_sel = None;
+        st.map_country.clear();
+        st.map_city.clear();
+        st.map_search.clear();
+        st.map_viewport_ids.clear();
         st.photo_sel = None;
         st.applied = None;
         st.apply_error = None;
@@ -886,6 +906,81 @@ fn back_to_idle(st: &mut State) {
 
 // ---------------------------------------------------------------- drawing
 
+/// Cover the viewport while keeping the album's camera, filters and selection.
+fn draw_fullscreen_map(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
+    let screen = ctx.content_rect();
+    let t = Tokens::get(ctx);
+    // Give TextField its usual lost-focus Escape so it restores the text before leaving the map.
+    let editing_escape = ctx.text_edit_focused() && !egui::Popup::is_any_open(ctx) && ctx.input(|input| input.key_pressed(egui::Key::Escape));
+    if editing_escape {
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+    }
+    let id = egui::Id::unique("geo-map-fullscreen");
+    let area = egui::Area::new(id)
+        .kind(egui::UiKind::Modal)
+        .fixed_pos(screen.min)
+        .default_size(screen.size())
+        .movable(false)
+        .constrain(false)
+        .fade_in(false)
+        .order(egui::Order::Foreground);
+    let modal = egui::Modal::new(id).area(area).frame(egui::Frame::NONE.fill(t.canvas).inner_margin(10)).show(ctx, |ui| {
+        let size = (screen.size() - vec2(20.0, 20.0)).max(vec2(1.0, 1.0));
+        ui.set_min_size(size);
+        ui.set_max_size(size);
+        lightcraft_ui_egui::widgets::register(ui, "geo:map:fullscreen", screen);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(i18n::tr("Map album")).font(t.semibold(15.0)).color(t.text));
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if Button::new(i18n::tr("Exit full screen map")).secondary().small().widget("geo:map:exitFullscreen").show(ui).clicked() {
+                    st.map_fullscreen = false;
+                }
+            });
+        });
+        draw_tracks_row(app, ui, st);
+        let all = groups(&st.parent, &st.places);
+        draw_album_map_actions(app, ui, st, &all);
+        if let Some(error) = &st.error {
+            warning(ui, error);
+        }
+        ui.add_space(6.0);
+        let height = ui.available_height().max(1.0);
+        let tracks = st.tracks.clone();
+        map::draw_map(app, ui, st, &all, &tracks, Some(height));
+
+        // The host dispatches shortcuts before drawing the extension. Retain focus on Escape
+        // so it cannot navigate or rate the hidden photo before this surface handles the key.
+        let focus = ui.interact(ui.min_rect(), egui::Id::unique("geo-map-fullscreen-focus"), Sense::focusable_noninteractive());
+        if ctx.memory(|memory| memory.focused().is_none()) {
+            focus.request_focus();
+        }
+        let text_edit = ctx.text_edit_focused();
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter { escape: true, horizontal_arrows: text_edit, vertical_arrows: text_edit, ..Default::default() },
+                );
+            }
+        });
+    });
+    if !editing_escape && !lightcraft_ui_egui::widgets::escape_taken(ctx) && modal.should_close() {
+        st.map_fullscreen = false;
+    }
+    if !st.map_fullscreen {
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        ctx.request_repaint();
+    }
+}
+
 fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     sync_snapshot(app, st);
     let footer_h = match st.phase {
@@ -1059,7 +1154,13 @@ fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     };
     let tracks = st.tracks.clone();
     card(ui, |ui| {
-        card_head(ui, Icon::Album, "Map album", |ui| status_pill(ui, &pill, kind));
+        card_head(ui, Icon::Album, "Map album", |ui| {
+            if Button::new(i18n::tr("Full screen map")).ghost().small().widget("geo:map:enterFullscreen").show(ui).clicked() {
+                st.map_fullscreen = true;
+                ui.ctx().request_repaint();
+            }
+            status_pill(ui, &pill, kind);
+        });
         draw_tracks_row(app, ui, st);
         if st.places.is_empty() && tracks.is_empty() {
             let line = if place_names_present() {
@@ -1072,6 +1173,7 @@ fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
         } else {
             let all = groups(&st.parent, &st.places);
             map::draw_map(app, ui, st, &all, &tracks, Some(ALBUM_MAP_H));
+            draw_album_map_actions(app, ui, st, &all);
         }
         ui.add_space(6.0);
         let mut line = trn("{n} in the album", &[("n", st.places.len().to_string())]);
@@ -1096,6 +1198,95 @@ fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             hint(ui, &trn("Added {n} photos automatically this session.", &[("n", st.added.to_string())]));
         }
     });
+}
+
+fn draw_album_map_actions(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, all: &[Group]) {
+    let t = Tokens::get(ui.ctx());
+    let countries: Vec<String> = {
+        let mut values: Vec<String> = all.iter().map(|g| g.country.clone()).filter(|v| !v.trim().is_empty()).collect();
+        values.sort_by_key(|v| v.to_lowercase());
+        values.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        values
+    };
+    let cities: Vec<String> = {
+        let mut values: Vec<String> = all
+            .iter()
+            .filter(|g| st.map_country.is_empty() || g.country.eq_ignore_ascii_case(&st.map_country))
+            .map(|g| g.city.clone())
+            .filter(|v| !v.trim().is_empty())
+            .collect();
+        values.sort_by_key(|v| v.to_lowercase());
+        values.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        values
+    };
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(i18n::tr("Map filters")).font(t.font(10.5)).color(t.text_dim));
+        let search = TextField::singleline("geo:map:search", &mut st.map_search).hint("Search places").width(145.0).show(ui);
+        if search.response.changed() {
+            st.map_sel = None;
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        let country_label = if st.map_country.is_empty() { i18n::tr("All countries").to_string() } else { st.map_country.clone() };
+        let country = lightcraft_ui_egui::widgets::dropdown(ui, "geo-map-country", &country_label, t.font(11.5), t.text_label);
+        lightcraft_ui_egui::widgets::register(ui, "geo:map:country", country.rect);
+        let mut next_country = None;
+        egui::Popup::menu(&country).show(|ui| {
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                if ui.selectable_label(st.map_country.is_empty(), i18n::tr("All countries")).clicked() {
+                    next_country = Some(String::new());
+                }
+                for value in &countries {
+                    if ui.selectable_label(st.map_country.eq_ignore_ascii_case(value), value).clicked() {
+                        next_country = Some(value.clone());
+                    }
+                }
+            });
+        });
+        if let Some(country) = next_country {
+            st.map_country = country;
+            st.map_city.clear();
+            st.map_sel = None;
+        }
+        let city_label = if st.map_city.is_empty() { i18n::tr("All cities").to_string() } else { st.map_city.clone() };
+        let city = lightcraft_ui_egui::widgets::dropdown(ui, "geo-map-city", &city_label, t.font(11.5), t.text_label);
+        lightcraft_ui_egui::widgets::register(ui, "geo:map:city", city.rect);
+        let mut next_city = None;
+        egui::Popup::menu(&city).show(|ui| {
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                if ui.selectable_label(st.map_city.is_empty(), i18n::tr("All cities")).clicked() {
+                    next_city = Some(String::new());
+                }
+                for value in &cities {
+                    if ui.selectable_label(st.map_city.eq_ignore_ascii_case(value), value).clicked() {
+                        next_city = Some(value.clone());
+                    }
+                }
+            });
+        });
+        if let Some(city) = next_city {
+            st.map_city = city;
+            st.map_sel = None;
+        }
+        if Button::new(i18n::tr("Show current map photos"))
+            .secondary()
+            .small()
+            .enabled(!st.map_viewport_ids.is_empty())
+            .widget("geo:map:viewport")
+            .show(ui)
+            .clicked()
+        {
+            let ids: Vec<u64> = st.map_viewport_ids.iter().map(|id| id.0).collect();
+            if let Err(e) = app.run("library.filter", serde_json::json!({ "only": ids, "onlyNone": false })) {
+                st.error = Some(e);
+            } else {
+                st.map_fullscreen = false;
+            }
+        }
+    });
+    let count = st.map_viewport_ids.len();
+    hint(ui, &trn("{n} photos in the current map area", &[("n", count.to_string())]));
 }
 
 fn draw_tracks_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
