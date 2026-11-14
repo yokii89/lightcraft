@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use lightcraft_testkit::skip;
 
 use super::config::Settings;
-use super::{Cause, Managed, Phase, apply_line, connection, find_interpreter, poll, reap, start_with, stop};
+use super::{Cause, Managed, Phase, apply_line, connection, drain_lines, find_interpreter, poll, reap, start_with, stop};
 
 // ---------------------------------------------------------------- protocol lines
 
@@ -194,4 +194,14 @@ fn the_manager_starts_and_stops_the_real_service() {
     assert_eq!(status.phase, Phase::Stopped);
     assert_eq!(status.cause, Cause::ManualStop);
     assert!(connection().is_none(), "a stopped service offers no endpoint");
+}
+
+#[test]
+fn the_pipe_drain_survives_bytes_that_are_not_utf8() {
+    // A zh-CN Python encoded the "…" of a log line as cp936 (A1 AD): the drain must keep
+    // reading — abandoning the pipe once turned the child's next write into [Errno 22] and
+    // left a service process hanging past its idle shutdown.
+    let mut lines = Vec::new();
+    drain_lines(&b"ok one\n\xa1\xad loading \nok two\n"[..], |line| lines.push(line.to_string()));
+    assert_eq!(lines, vec!["ok one", "\u{FFFD}\u{FFFD} loading ", "ok two"]);
 }

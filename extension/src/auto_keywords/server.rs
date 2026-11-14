@@ -165,6 +165,8 @@ fn start_inner(m: &mut Managed, settings: &Settings, stub: bool) -> Result<(), S
         .arg(settings.model_repo())
         .arg("--idle-timeout")
         .arg(config::IDLE_SECS.to_string())
+        // The script reconfigures its stdio to UTF-8 too; this covers anything printed before.
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -248,15 +250,29 @@ fn reap(m: &mut Managed, success: bool, code: Option<i32>) {
     }
 }
 
+/// Drain a pipe one line at a time, decoding each line lossily, until EOF. A non-UTF-8 byte (a
+/// zh-CN Python writing cp936 stderr) must not end the drain: an abandoned pipe turns the
+/// child's next write into `[Errno 22] Invalid argument`, and a full one blocks it forever —
+/// the failure that once left a service process hanging for hours.
+fn drain_lines(reader: impl std::io::Read, mut on_line: impl FnMut(&str)) {
+    let mut reader = BufReader::new(reader);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if matches!(reader.read_until(b'\n', &mut bytes), Ok(0) | Err(_)) {
+            break;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        on_line(line.trim_end_matches(['\n', '\r']));
+    }
+}
+
 /// The stdout reader: protocol lines only, one [`apply_line`] each.
 fn read_stdout(stdout: std::process::ChildStdout) {
     std::thread::Builder::new()
         .name("auto-keywords-service-stdout".to_string())
         .spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                apply_line(&mut lock(), &line);
-            }
+            drain_lines(stdout, |line| apply_line(&mut lock(), line));
         })
         .map_err(|e| log::warn!("auto keywords: could not start the stdout reader: {e}"))
         .ok();
@@ -293,20 +309,19 @@ fn read_stderr(stderr: std::process::ChildStderr) {
     std::thread::Builder::new()
         .name("auto-keywords-service-stderr".to_string())
         .spawn(move || {
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
+            drain_lines(stderr, |line| {
                 if line.trim().is_empty() {
-                    continue;
+                    return;
                 }
                 // progress bars redraw in place: keep only each line's last segment
-                let line = line.rsplit('\r').next().unwrap_or(&line).trim_end();
+                let line = line.rsplit('\r').next().unwrap_or(line).trim_end();
                 let line = if line.chars().count() > 200 { line.chars().take(200).collect::<String>() } else { line.to_string() };
                 let mut m = lock();
                 if m.stderr_tail.len() >= STDERR_TAIL_LINES {
                     m.stderr_tail.remove(0);
                 }
                 m.stderr_tail.push(line);
-            }
+            });
         })
         .map_err(|e| log::warn!("auto keywords: could not start the stderr reader: {e}"))
         .ok();

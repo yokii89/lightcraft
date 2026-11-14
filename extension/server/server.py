@@ -82,7 +82,10 @@ def emit(line: str) -> None:
 
 def log(message: str) -> None:
     """A diagnostic line on stderr; timestamps keep a long model download readable."""
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass  # a broken pipe (LightCraft died) must not kill the thread that is loading
 
 
 def use_linear_patch_embed(model, torch) -> bool:
@@ -563,6 +566,12 @@ def watchdog(service: Service) -> None:
 
 
 def main() -> None:
+    # LightCraft reads both pipes as UTF-8. A console-default encoding (cp936 on a zh-CN
+    # Windows) would turn the first non-ASCII byte — even the ellipsis in a log line — into
+    # bytes the reader refuses, which once broke the drain and hung the service. Reconfigure
+    # before anything is printed, and never let a diagnostic raise.
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description="LightCraft Auto Keywords local model service")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Hugging Face repo id, or a local weights directory")
     parser.add_argument("--token", required=True, help="shared secret every request must carry")
