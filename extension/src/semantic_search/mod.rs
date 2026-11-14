@@ -20,7 +20,9 @@ use lightcraft_ui_egui::text_field::{Ending, TextField};
 use lightcraft_ui_egui::theme::Tokens;
 use lightcraft_ui_egui::{LightcraftApp, i18n, widgets};
 
-use crate::ui::{card, card_head, hint, photo_thumb, trn, warning};
+use crate::ui::{
+    Pill, action_bar, action_note, card, card_head, hint, photo_thumb, primary_action, secondary_action, split_page, status_pill, trn, warning,
+};
 use store::Description;
 use worker::{Library, Operation, Reply};
 
@@ -38,6 +40,8 @@ struct State {
     error: Option<String>,
     search_revision: Option<u64>,
     searching: bool,
+    searched: bool,
+    advanced: bool,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -135,6 +139,7 @@ fn start(app: &LightcraftApp, st: &mut State, operation: Operation) {
         }
     };
     st.searching = matches!(operation, Operation::Search { .. });
+    st.searched = false;
     st.search_revision = st.searching.then_some(app.session.catalog.revision);
     st.cancel.store(true, Ordering::Relaxed);
     st.cancel = Arc::new(AtomicBool::new(false));
@@ -163,6 +168,7 @@ pub(crate) fn page(app: &mut LightcraftApp, ui: &mut Ui) {
         match rx.try_recv() {
             Ok(Ok(reply)) => {
                 st.reply = reply;
+                st.searched = st.searching;
                 st.pending = None;
             }
             Ok(Err(error)) => {
@@ -193,18 +199,68 @@ pub(crate) fn page(app: &mut LightcraftApp, ui: &mut Ui) {
         }
     }
     widgets::register(ui, format!("page:{PAGE_ID}"), ui.max_rect());
-    egui::ScrollArea::vertical().id_salt("semantic-scroll").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::NONE.inner_margin(12).show(ui, |ui| draw(app, ui, &mut st));
-    });
+    draw(app, ui, &mut st);
 }
 
 fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let t = Tokens::get(ui.ctx());
-    let busy = st.pending.is_some();
+    let (body, footer) = split_page(ui, 66.0);
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    egui::ScrollArea::vertical().id_salt("semantic-scroll").auto_shrink([false, false]).show(&mut body_ui, |ui| {
+        egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            draw_query(app, ui, st);
+            if let Some(error) = &st.error {
+                warning(ui, &format!("{}: {}", i18n::tr("Search error"), i18n::tr(error)));
+            }
+            if let Some(note) = &st.reply.warning {
+                warning(ui, i18n::tr(note));
+            }
+            if st.searched {
+                draw_results(app, ui, st);
+            }
+            // A very short dock cannot reserve a footer; keep the action reachable by scrolling.
+            if footer.is_none() {
+                draw_action(app, ui, st);
+            }
+        });
+    });
+    if let Some(bar) = footer {
+        let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+        action_bar(&mut bar_ui, |ui| draw_action(app, ui, st));
+    }
+}
+
+fn submit_search(app: &LightcraftApp, st: &mut State) {
+    if st.query.trim().is_empty() || st.pending.is_some() {
+        return;
+    }
+    match snapshot(app) {
+        Ok(photos) => start(app, st, Operation::Search { photos, query: st.query.trim().to_string(), minimum: st.minimum }),
+        Err(error) => st.error = Some(error),
+    }
+}
+
+fn draw_action(app: &LightcraftApp, ui: &mut Ui, st: &mut State) {
+    if st.pending.is_some() {
+        if secondary_action(ui, i18n::tr("Stop"), true, "semantic:stop") {
+            st.cancel.store(true, Ordering::Relaxed);
+        }
+        action_note(ui, i18n::tr("The task continues if the panel closes."));
+    } else {
+        if primary_action(ui, i18n::tr("Search"), !st.query.trim().is_empty(), "semantic:search") {
+            submit_search(app, st);
+        }
+        action_note(ui, i18n::tr("Search the entire library."));
+    }
+}
+
+fn draw_query(app: &LightcraftApp, ui: &mut Ui, st: &mut State) {
     card(ui, |ui| {
-        card_head(ui, Icon::Search, "Semantic Photo Search", |_| {});
-        hint(ui, i18n::tr("Describe what you want to find. Text embeddings run on your GPU."));
-        ui.add_space(8.0);
+        card_head(ui, Icon::Search, "Search photos", |ui| {
+            if st.pending.is_some() {
+                status_pill(ui, "Working…", Pill::Busy);
+            }
+        });
         let query = TextField::singleline("semantic:query", &mut st.query)
             .hint(i18n::tr("For example: a dog running on the grass"))
             .width(ui.available_width())
@@ -214,96 +270,120 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             st.cancel.store(true, Ordering::Relaxed);
             st.pending = None;
             st.reply.hits.clear();
+            st.reply.warning = None;
+            st.error = None;
+            st.searched = false;
         }
-        ui.horizontal_wrapped(|ui| {
-            let submit = Button::new(i18n::tr("Search")).primary().enabled(!st.query.trim().is_empty()).widget("semantic:search").show(ui).clicked()
-                || query.ending == Some(Ending::Return);
-            if submit && !st.query.trim().is_empty() {
-                match snapshot(app) {
-                    Ok(photos) => start(app, st, Operation::Search { photos, query: st.query.trim().to_string(), minimum: st.minimum }),
-                    Err(error) => st.error = Some(error),
-                }
-            }
-            if busy && Button::new(i18n::tr("Stop")).secondary().widget("semantic:stop").show(ui).clicked() {
-                st.cancel.store(true, Ordering::Relaxed);
-            }
-        });
-        if busy {
-            ui.label(i18n::tr("Working in the background…"));
+        if query.ending == Some(Ending::Return) {
+            submit_search(app, st);
         }
-    });
-    card(ui, |ui| {
-        card_head(ui, Icon::Info, "Search index", |_| {});
-        hint(
-            ui,
-            &trn(
-                "{descriptions} descriptions · {indexed} indexed photos",
-                &[("descriptions", st.reply.descriptions.to_string()), ("indexed", st.reply.indexed.to_string())],
-            ),
-        );
-        hint(ui, i18n::tr("Generate and accept descriptions in Auto Keywords, then update this index. Existing keywords and captions also work."));
         ui.add_space(6.0);
-        if Button::new(i18n::tr("Update search index")).secondary().enabled(!busy).widget("semantic:index").show(ui).clicked() {
-            match snapshot(app) {
-                Ok(photos) => start(app, st, Operation::Index(photos)),
-                Err(error) => st.error = Some(error),
-            }
+        let chevron = if st.advanced { Icon::ChevronDown } else { Icon::ChevronRight };
+        if Button::new(i18n::tr("Advanced")).icon(chevron).ghost().small().widget("semantic:advanced").show(ui).clicked() {
+            st.advanced = !st.advanced;
         }
-        egui::CollapsingHeader::new(i18n::tr("Model and matching")).show(ui, |ui| {
-            hint(ui, i18n::tr("Chinese text model · about 96 MB · GPU required. Download once, then use offline."));
-            if Button::new(i18n::tr("Download text model (96 MB)")).secondary().enabled(!busy).widget("semantic:download").show(ui).clicked() {
-                start(app, st, Operation::Download);
-            }
-            hint(ui, i18n::tr("The model is released after 60 idle seconds. Your photos are never uploaded."));
-            ui.label(i18n::tr("Minimum semantic similarity"));
-            let slider = ui.add(egui::Slider::new(&mut st.minimum, 0.3..=0.95).fixed_decimals(2));
-            widgets::register(ui, "semantic:minimum", slider.rect);
-            hint(ui, i18n::tr("Similarity is a ranking signal, not a confidence percentage. Higher values return fewer matches."));
-        });
+        if st.advanced {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            draw_advanced(app, ui, st);
+        }
     });
-    if let Some(error) = &st.error {
-        warning(ui, &format!("{}: {}", i18n::tr("Search error"), i18n::tr(error)));
-    }
-    if let Some(note) = &st.reply.warning {
-        warning(ui, i18n::tr(note));
-    }
+}
+
+fn draw_advanced(app: &LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let t = Tokens::get(ui.ctx());
+    let busy = st.pending.is_some();
+    ui.label(RichText::new(i18n::tr("Search index")).font(t.semibold(11.0)).color(t.text_label));
     hint(
         ui,
         &trn(
-            "{built} updated · {skipped} skipped · {ms} ms",
-            &[("built", st.reply.built.to_string()), ("skipped", st.reply.skipped.to_string()), ("ms", st.reply.elapsed_ms.to_string())],
+            "{descriptions} descriptions · {indexed} indexed photos",
+            &[("descriptions", st.reply.descriptions.to_string()), ("indexed", st.reply.indexed.to_string())],
         ),
     );
+    if secondary_action(ui, i18n::tr("Update search index"), !busy, "semantic:index") {
+        match snapshot(app) {
+            Ok(photos) => start(app, st, Operation::Index(photos)),
+            Err(error) => st.error = Some(error),
+        }
+    }
+    hint(ui, i18n::tr("Accept descriptions in Auto Keywords, then update the index."));
+    ui.add_space(8.0);
+    ui.label(RichText::new(i18n::tr("Model and matching")).font(t.semibold(11.0)).color(t.text_label));
+    if secondary_action(ui, i18n::tr("Download text model (96 MB)"), !busy, "semantic:download") {
+        start(app, st, Operation::Download);
+    }
+    hint(ui, i18n::tr("GPU required. Download once, then use offline."));
+    ui.add_space(6.0);
+    ui.label(RichText::new(i18n::tr("Minimum semantic similarity")).font(t.font(11.0)).color(t.text_label));
+    let slider = ui.add(egui::Slider::new(&mut st.minimum, 0.3..=0.95).fixed_decimals(2));
+    widgets::register(ui, "semantic:minimum", slider.rect);
+    hint(ui, i18n::tr("Higher values return fewer semantic matches."));
+    if st.reply.built > 0 || st.reply.skipped > 0 || st.reply.elapsed_ms > 0 {
+        ui.add_space(8.0);
+        hint(
+            ui,
+            &trn(
+                "{built} updated · {skipped} skipped · {ms} ms",
+                &[("built", st.reply.built.to_string()), ("skipped", st.reply.skipped.to_string()), ("ms", st.reply.elapsed_ms.to_string())],
+            ),
+        );
+    }
+}
+
+fn draw_results(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let t = Tokens::get(ui.ctx());
     let hits: Vec<_> = st.reply.hits.iter().filter(|h| app.session.catalog.photo(PhotoId(h.id)).is_some_and(|p| p.in_library())).cloned().collect();
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(trn("{n} search results", &[("n", hits.len().to_string())])).font(t.semibold(12.0)));
-        if Button::new(i18n::tr("Show results in library")).secondary().small().enabled(!hits.is_empty()).widget("semantic:show").show(ui).clicked() {
+    card(ui, |ui| {
+        card_head(ui, Icon::GridSquare, "Search results", |ui| {
+            hint(ui, &hits.len().to_string());
+        });
+        if hits.is_empty() {
+            hint(ui, i18n::tr("No matching photos. Try a different description."));
+            return;
+        }
+        if secondary_action(ui, i18n::tr("Show results in library"), true, "semantic:show") {
             let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
             if let Err(error) = app.run("library.filter", serde_json::json!({"only": ids, "onlyNone": false})) {
                 st.error = Some(error);
             }
         }
-    });
-    let mut budget = 3;
-    for hit in &hits {
-        let Some(photo) = app.session.catalog.photo(PhotoId(hit.id)) else { continue };
-        let name = photo.file_name.clone();
-        card(ui, |ui| {
+        ui.add_space(8.0);
+        let mut budget = 3;
+        for (index, hit) in hits.iter().enumerate() {
+            if index > 0 {
+                ui.separator();
+                ui.add_space(4.0);
+            }
+            let Some(photo) = app.session.catalog.photo(PhotoId(hit.id)) else { continue };
+            let name = photo.file_name.clone();
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(56.0, 40.0), egui::Sense::hover());
                 photo_thumb(app, ui, rect, hit.id, &mut budget);
-                if Button::new(&name).ghost().small().widget(format!("semantic:photo:{}", hit.id)).show(ui).clicked()
-                    && let Err(error) = app.run("library.select", serde_json::json!({"ids": [hit.id], "active": hit.id}))
-                {
-                    st.error = Some(error);
-                }
+                ui.vertical(|ui| {
+                    let response = ui.add(
+                        egui::Label::new(RichText::new(&name).font(t.semibold(11.0)).color(t.text_label)).truncate().sense(egui::Sense::click()),
+                    );
+                    widgets::register(ui, format!("semantic:photo:{}", hit.id), response.rect);
+                    let selected = response.clicked()
+                        || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)));
+                    response.on_hover_text(&name);
+                    if selected && let Err(error) = app.run("library.select", serde_json::json!({"ids": [hit.id], "active": hit.id})) {
+                        st.error = Some(error);
+                    }
+                    let response = ui.add(egui::Label::new(RichText::new(&hit.text).font(t.font(10.5)).color(t.text_dim)).truncate());
+                    response.on_hover_ui(|ui| {
+                        ui.label(&hit.text);
+                        if let Some(similarity) = hit.semantic {
+                            hint(ui, &format!("{}: {similarity:.3}", i18n::tr("Semantic similarity")));
+                        }
+                    });
+                });
             });
-            ui.label(RichText::new(&hit.text).font(t.font(11.0)));
-            if let Some(similarity) = hit.semantic {
-                hint(ui, &format!("{}: {similarity:.3}", i18n::tr("Semantic similarity")));
-            }
-        });
-    }
+            ui.add_space(4.0);
+        }
+    });
 }
 
 #[cfg(test)]

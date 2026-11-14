@@ -34,7 +34,7 @@ use lightcraft_engine::cmd::keywords as keywords_cmd;
 use lightcraft_geocode::{GEONAMES_FILES, GeoNames, LatLon};
 use lightcraft_meta::{Tracklog, parse_gpx};
 use lightcraft_ui_egui::button::Button;
-use lightcraft_ui_egui::icons::{self, Icon};
+use lightcraft_ui_egui::icons::Icon;
 use lightcraft_ui_egui::pick::PickRequest;
 use lightcraft_ui_egui::progress::spinner;
 use lightcraft_ui_egui::text_field::TextField;
@@ -43,8 +43,8 @@ use lightcraft_ui_egui::{LightcraftApp, i18n};
 use serde_json::Value;
 
 use crate::ui::{
-    Pill, action_bar, action_note, card, card_head, field, hint, path_example, primary_action, split_page, status_pill, success_card, trn, warning,
-    with_alpha,
+    Pill, action_bar, action_note, card, card_head, disclosure, hint, path_example, primary_action, secondary_action, split_page, status_pill,
+    success_card, trn, warning,
 };
 
 mod map;
@@ -192,6 +192,9 @@ struct Sync {
 #[derive(Default)]
 struct State {
     parent: String,
+    /// Keep optional configuration and GPX management out of the default map view.
+    advanced: bool,
+    tracks_open: bool,
     phase: Phase,
     /// The last `metadata.placeNamesStatus` answer.
     status: Option<Value>,
@@ -941,7 +944,7 @@ fn draw_fullscreen_map(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut St
                 }
             });
         });
-        draw_tracks_row(app, ui, st);
+        draw_tracks_section(app, ui, st);
         let all = groups(&st.parent, &st.places);
         draw_album_map_actions(app, ui, st, &all);
         if let Some(error) = &st.error {
@@ -1022,7 +1025,7 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 enter_review(st);
             }
             let note = if dataset_ready(st.status.as_ref()) {
-                i18n::tr("New photos join the album automatically; confirm each place before writing.")
+                i18n::tr("Review places before writing keywords.")
             } else {
                 i18n::tr("Download the place names once.")
             };
@@ -1039,7 +1042,7 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             let note = if out > 0 {
                 trn("Not written: {n} photos", &[("n", out.to_string())])
             } else {
-                i18n::tr("The write is one undo step; revert it from Edit ▸ Undo.").to_string()
+                i18n::tr("One undo step reverts the whole batch.").to_string()
             };
             action_note(ui, &note);
         }
@@ -1047,97 +1050,85 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     });
 }
 
-/// The idle page is the album's home: the dataset card, the album card (the map of everything
-/// already in the album, with the sync's progress), the parent keyword.
+/// The album is the main content; show setup only when required, and fold configuration away.
 fn draw_idle(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let status = st.status.clone();
-    let downloading = status.as_ref().and_then(|v| v.get("downloading")).and_then(Value::as_bool).unwrap_or(false);
-    let ready = dataset_ready(status.as_ref());
-    card(ui, |ui| {
-        let (pill, kind) = if downloading {
-            ("Downloading…", Pill::Busy)
-        } else if ready {
-            ("Ready", Pill::Ready)
-        } else {
-            ("Not downloaded", Pill::Idle)
-        };
-        card_head(ui, Icon::Info, "Place names", |ui| status_pill(ui, pill, kind));
-        let t = Tokens::get(ui.ctx());
-        let title = if downloading {
-            i18n::tr("Downloading…").to_string()
-        } else if ready {
-            status
-                .as_ref()
-                .and_then(|v| v.get("bytes"))
-                .and_then(Value::as_u64)
-                .map(|bytes| trn("Ready · {mb} MB", &[("mb", format!("{:.1}", bytes as f64 / (1 << 20) as f64))]))
-                .unwrap_or_else(|| i18n::tr("Ready").to_string())
-        } else {
-            i18n::tr("Offline place names").to_string()
-        };
-        let line = if ready {
-            i18n::tr("The place names list towns of 15 000 people or more.")
-        } else {
-            i18n::tr("Download once, then lookups are fully offline. About 3 MB.")
-        };
-        ui.horizontal(|ui| {
-            let (tile, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
-            let p = ui.painter();
-            p.rect_filled(tile, 7.0, with_alpha(t.accent, 20));
-            icons::paint(p, tile.shrink(7.0), Icon::Info, t.accent);
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).font(t.font(11.5)).color(t.text_label));
-                ui.label(RichText::new(line).font(t.font(10.0)).color(t.text_dim));
-            });
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if ready {
-                    if Button::new(i18n::tr("Re-check")).ghost().small().widget("geo:recheck").show(ui).clicked() {
-                        status_soon(st);
-                    }
-                } else if Button::new(i18n::tr("Download")).secondary().small().widget("geo:download").show(ui).clicked() {
-                    start_download(app, st);
-                }
-            });
-        });
-        if let Some(e) = &st.error {
-            ui.add_space(4.0);
-            warning(ui, e);
-        }
-        ui.add_space(7.0);
-        ui.separator();
-        ui.add_space(4.0);
-        let attribution = status.as_ref().and_then(|v| v.get("attribution")).and_then(Value::as_str).unwrap_or("GeoNames · CC-BY 4.0");
-        hint(ui, attribution);
-    });
     draw_album_card(app, ui, st);
+    if let Some(error) = &st.error {
+        warning(ui, error);
+    }
+    let ready = dataset_ready(st.status.as_ref());
+    if !ready {
+        card(ui, |ui| draw_dataset(app, ui, st));
+    }
     card(ui, |ui| {
-        card_head(ui, Icon::Tag, "Keywords", |_| {});
-        field(ui, "Parent keyword", |ui| {
-            let resp = TextField::singleline("geo:parent", &mut st.parent).hint(PARENT_DEFAULT).width(120.0).show(ui);
-            if resp.response.changed() || resp.committed() {
+        if disclosure(ui, "Map settings", &mut st.advanced, "geo:advanced") {
+            let t = Tokens::get(ui.ctx());
+            ui.label(RichText::new(i18n::tr("Parent keyword")).font(t.font(11.0)).color(t.text_dim));
+            let response = TextField::singleline("geo:parent", &mut st.parent).hint(PARENT_DEFAULT).width(ui.available_width()).show(ui);
+            if response.response.changed() || response.committed() {
                 st.parent = keywords::clean(&st.parent);
-                // the album remembers the parent between sessions (§05)
+                // The album remembers the parent between sessions (§05).
                 st.store.parent = st.parent.clone();
                 st.store_dirty = true;
                 st.store_gen += 1;
                 st.groups_off.clear();
                 save_soon(st);
             }
-        });
-        let parent = if st.parent.trim().is_empty() { i18n::tr("Country").to_string() } else { st.parent.trim().to_string() };
-        path_example(ui, &[parent.as_str(), "中国", "杭州"]);
-        hint(ui, i18n::tr("A photo taken in a smaller town classifies by its country."));
+            let parent = if st.parent.trim().is_empty() { i18n::tr("Country").to_string() } else { st.parent.trim().to_string() };
+            path_example(ui, &[parent.as_str(), "中国", "杭州"]);
+            hint(ui, i18n::tr("A photo taken in a smaller town classifies by its country."));
+            if ready {
+                ui.add_space(8.0);
+                draw_dataset(app, ui, st);
+            }
+            draw_album_details(ui, st);
+        }
     });
+    let attribution = st.status.as_ref().and_then(|v| v.get("attribution")).and_then(Value::as_str).unwrap_or("GeoNames · CC-BY 4.0");
+    let t = Tokens::get(ui.ctx());
+    ui.label(RichText::new("GeoNames · CC-BY 4.0").font(t.font(9.5)).color(t.text_dim)).on_hover_text(attribution);
+}
+
+fn draw_dataset(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let status = st.status.clone();
+    let downloading = status.as_ref().and_then(|v| v.get("downloading")).and_then(Value::as_bool).unwrap_or(false);
+    let ready = dataset_ready(status.as_ref());
+    let (pill, kind) = if downloading {
+        ("Downloading…", Pill::Busy)
+    } else if ready {
+        ("Ready", Pill::Ready)
+    } else {
+        ("Not downloaded", Pill::Idle)
+    };
+    card_head(ui, Icon::Info, "Place names", |ui| status_pill(ui, pill, kind));
+    if ready {
+        if Button::new(i18n::tr("Re-check")).ghost().small().widget("geo:recheck").show(ui).clicked() {
+            status_soon(st);
+        }
+        hint(ui, i18n::tr("The place names list towns of 15 000 people or more."));
+    } else {
+        hint(ui, i18n::tr("Download once, then lookups are fully offline. About 3 MB."));
+        ui.add_space(4.0);
+        if secondary_action(ui, i18n::tr("Download"), !downloading, "geo:download") {
+            start_download(app, st);
+        }
+    }
+}
+
+fn draw_album_details(ui: &mut Ui, st: &State) {
+    for (label, count) in
+        [("{n} without a place", st.unmatched), ("{n} without GPS", st.no_gps), ("Added {n} photos automatically this session.", st.added)]
+    {
+        if count > 0 {
+            hint(ui, &trn(label, &[("n", count.to_string())]));
+        }
+    }
 }
 
 /// The album card: the map of everything the album holds (the photos the sync has classified),
 /// with the sync's progress and the counts the write would cover.
 fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let syncing = st.sync.cursor < st.sync.queue.len();
-    let queued = st.sync.queue.len() - st.sync.cursor.min(st.sync.queue.len());
     let pill = if syncing {
         i18n::tr("Syncing…").to_string()
     } else if st.places.is_empty() {
@@ -1155,49 +1146,34 @@ fn draw_album_card(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let tracks = st.tracks.clone();
     card(ui, |ui| {
         card_head(ui, Icon::Album, "Map album", |ui| {
-            if Button::new(i18n::tr("Full screen map")).ghost().small().widget("geo:map:enterFullscreen").show(ui).clicked() {
+            if Button::icon_only(Icon::Single, "Full screen map").ghost().small().widget("geo:map:enterFullscreen").show(ui).clicked() {
                 st.map_fullscreen = true;
                 ui.ctx().request_repaint();
             }
             status_pill(ui, &pill, kind);
         });
-        draw_tracks_row(app, ui, st);
         if st.places.is_empty() && tracks.is_empty() {
-            let line = if place_names_present() {
-                i18n::tr("Photos with a GPS position join the album automatically.")
-            } else {
-                i18n::tr("Download the place names, and photos with a GPS position join the album automatically.")
-            };
-            ui.add_space(2.0);
-            hint(ui, line);
+            hint(ui, i18n::tr("Photos with a GPS position join the album automatically."));
         } else {
             let all = groups(&st.parent, &st.places);
             map::draw_map(app, ui, st, &all, &tracks, Some(ALBUM_MAP_H));
             draw_album_map_actions(app, ui, st, &all);
         }
-        ui.add_space(6.0);
-        let mut line = trn("{n} in the album", &[("n", st.places.len().to_string())]);
-        if !st.pending.is_empty() {
-            line.push_str(" · ");
-            line.push_str(&trn("{n} to write", &[("n", st.pending.len().to_string())]));
-        }
-        if st.unmatched > 0 {
-            line.push_str(" · ");
-            line.push_str(&trn("{n} without a place", &[("n", st.unmatched.to_string())]));
-        }
-        if st.no_gps > 0 {
-            line.push_str(" · ");
-            line.push_str(&trn("{n} without GPS", &[("n", st.no_gps.to_string())]));
-        }
-        hint(ui, &line);
         if syncing {
-            ui.add_space(2.0);
+            let queued = st.sync.queue.len().saturating_sub(st.sync.cursor);
             hint(ui, &trn("Adding {n} photos…", &[("n", queued.to_string())]));
-        } else if st.added > 0 {
-            ui.add_space(2.0);
-            hint(ui, &trn("Added {n} photos automatically this session.", &[("n", st.added.to_string())]));
         }
+        ui.add_space(6.0);
+        draw_tracks_section(app, ui, st);
     });
+}
+
+fn draw_tracks_section(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
+    let title =
+        if st.tracks.is_empty() { i18n::tr("GPX tracks").to_string() } else { trn("GPX tracks ({n})", &[("n", st.tracks.len().to_string())]) };
+    if disclosure(ui, &title, &mut st.tracks_open, "geo:tracks") {
+        draw_tracks_row(app, ui, st);
+    }
 }
 
 fn draw_album_map_actions(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, all: &[Group]) {
@@ -1220,16 +1196,15 @@ fn draw_album_map_actions(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, 
         values
     };
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(i18n::tr("Map filters")).font(t.font(10.5)).color(t.text_dim));
-        let search = TextField::singleline("geo:map:search", &mut st.map_search).hint("Search places").width(145.0).show(ui);
-        if search.response.changed() {
-            st.map_sel = None;
-        }
-    });
+    let search =
+        TextField::singleline("geo:map:search", &mut st.map_search).hint(i18n::tr("Search places")).width(ui.available_width().min(360.0)).show(ui);
+    if search.response.changed() {
+        st.map_sel = None;
+    }
     ui.horizontal_wrapped(|ui| {
+        let filter_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(40.0);
         let country_label = if st.map_country.is_empty() { i18n::tr("All countries").to_string() } else { st.map_country.clone() };
-        let country = lightcraft_ui_egui::widgets::dropdown(ui, "geo-map-country", &country_label, t.font(11.5), t.text_label);
+        let country = lightcraft_ui_egui::widgets::dropdown_within(ui, "geo-map-country", &country_label, t.font(11.5), t.text_label, filter_width);
         lightcraft_ui_egui::widgets::register(ui, "geo:map:country", country.rect);
         let mut next_country = None;
         egui::Popup::menu(&country).show(|ui| {
@@ -1250,7 +1225,7 @@ fn draw_album_map_actions(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, 
             st.map_sel = None;
         }
         let city_label = if st.map_city.is_empty() { i18n::tr("All cities").to_string() } else { st.map_city.clone() };
-        let city = lightcraft_ui_egui::widgets::dropdown(ui, "geo-map-city", &city_label, t.font(11.5), t.text_label);
+        let city = lightcraft_ui_egui::widgets::dropdown_within(ui, "geo-map-city", &city_label, t.font(11.5), t.text_label, filter_width);
         lightcraft_ui_egui::widgets::register(ui, "geo:map:city", city.rect);
         let mut next_city = None;
         egui::Popup::menu(&city).show(|ui| {
@@ -1269,62 +1244,38 @@ fn draw_album_map_actions(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, 
             st.map_city = city;
             st.map_sel = None;
         }
-        if Button::new(i18n::tr("Show current map photos"))
-            .secondary()
-            .small()
-            .enabled(!st.map_viewport_ids.is_empty())
-            .widget("geo:map:viewport")
-            .show(ui)
-            .clicked()
-        {
-            let ids: Vec<u64> = st.map_viewport_ids.iter().map(|id| id.0).collect();
-            if let Err(e) = app.run("library.filter", serde_json::json!({ "only": ids, "onlyNone": false })) {
-                st.error = Some(e);
-            } else {
-                st.map_fullscreen = false;
-            }
-        }
     });
-    let count = st.map_viewport_ids.len();
-    hint(ui, &trn("{n} photos in the current map area", &[("n", count.to_string())]));
+    let label = trn("Show map photos ({n})", &[("n", st.map_viewport_ids.len().to_string())]);
+    if secondary_action(ui, &label, !st.map_viewport_ids.is_empty(), "geo:map:viewport") {
+        let ids: Vec<u64> = st.map_viewport_ids.iter().map(|id| id.0).collect();
+        if let Err(e) = app.run("library.filter", serde_json::json!({ "only": ids, "onlyNone": false })) {
+            st.error = Some(e);
+        } else {
+            st.map_fullscreen = false;
+        }
+    }
 }
 
 fn draw_tracks_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let ctx = ui.ctx().clone();
     let selected = app.session.selection.ids.len();
-    ui.horizontal(|ui| {
-        if Button::new(i18n::tr("Add GPX track"))
-            .secondary()
-            .small()
-            .enabled(app.services.picker.is_some() || app.services.pick_tracklog.is_some())
-            .widget("geo:track:add")
-            .show(ui)
-            .clicked()
-        {
-            pick_track(app, &ctx, st);
-        }
-        ui.label(trn("{n} selected", &[("n", selected.to_string())]));
-    });
+    let can_pick = app.services.picker.is_some() || app.services.pick_tracklog.is_some();
+    if secondary_action(ui, i18n::tr("Add GPX track"), can_pick, "geo:track:add") {
+        pick_track(app, &ctx, st);
+    }
+    if !st.tracks.is_empty() && selected > 0 {
+        hint(ui, &trn("{n} selected", &[("n", selected.to_string())]));
+    }
     for (index, track) in st.tracks.clone().into_iter().enumerate() {
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(trn("{name} · {n} points", &[("name", track.name.clone()), ("n", track.log.points.len().to_string())]));
+            let title = trn("{name} · {n} points", &[("name", track.name.clone()), ("n", track.log.points.len().to_string())]);
+            let width = (ui.available_width() - 48.0 - 2.0 * ui.spacing().item_spacing.x).max(1.0);
+            ui.add_sized([width, 24.0], egui::Label::new(&title).truncate()).on_hover_text(&title);
             if Button::icon_only(Icon::Target, "Focus on GPX track").ghost().small().widget(format!("geo:track:focus:{index}")).show(ui).clicked()
                 && let Some(view) = map::fit_track(&track.log)
             {
                 st.map = view;
-            }
-            if Button::new(i18n::tr("Match selected photos"))
-                .secondary()
-                .small()
-                .enabled(selected > 0)
-                .widget(format!("geo:track:match:{index}"))
-                .show(ui)
-                .clicked()
-            {
-                let ids: Vec<u64> = app.session.selection.ids.iter().map(|id| id.0).collect();
-                if let Err(e) = app.run("photo.tagFromTracklog", serde_json::json!({ "path": track.path, "ids": ids })) {
-                    st.error = Some(e);
-                }
             }
             if Button::icon_only(Icon::Close, "Remove GPX track").ghost().small().widget(format!("geo:track:remove:{index}")).show(ui).clicked() {
                 st.tracks.retain(|loaded| loaded.path != track.path);
@@ -1335,6 +1286,12 @@ fn draw_tracks_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 save_soon(st);
             }
         });
+        if secondary_action(ui, i18n::tr("Match selected photos"), selected > 0, &format!("geo:track:match:{index}")) {
+            let ids: Vec<u64> = app.session.selection.ids.iter().map(|id| id.0).collect();
+            if let Err(e) = app.run("photo.tagFromTracklog", serde_json::json!({ "path": track.path, "ids": ids })) {
+                st.error = Some(e);
+            }
+        }
     }
 }
 
@@ -1370,18 +1327,18 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 }
             });
         });
-        ui.add_space(5.0);
-        hint(
-            ui,
-            &trn(
-                "Outside China: {n} photos · no match: {m} · no GPS: {k} — not shown, not written",
-                &[("n", abroad.to_string()), ("m", st.unmatched.to_string()), ("k", st.no_gps.to_string())],
-            ),
-        );
+        if abroad > 0 || st.unmatched > 0 || st.no_gps > 0 {
+            ui.add_space(5.0);
+            hint(
+                ui,
+                &trn(
+                    "Outside China: {n} photos · no match: {m} · no GPS: {k} — not shown, not written",
+                    &[("n", abroad.to_string()), ("m", st.unmatched.to_string()), ("k", st.no_gps.to_string())],
+                ),
+            );
+        }
     });
     map::draw_map(app, ui, st, &all, &tracks, None);
-    ui.add_space(6.0);
-    hint(ui, i18n::tr("Bubble size = photo count · scroll to zoom, drag to pan · zoom in for photo thumbnails"));
 }
 
 /// The done page: what was written, the undo, back to the album.

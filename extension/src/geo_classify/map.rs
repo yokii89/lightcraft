@@ -1070,43 +1070,49 @@ pub(super) fn select_place_photos(app: &mut lightcraft_ui_egui::LightcraftApp, p
 
 /// The preset chips (top left) and the zoom buttons (top right), as foreground areas.
 fn draw_controls(st: &mut State, ui: &mut Ui, rect: Rect) {
-    egui::Area::new(Id::unique("geo-map-chips")).fixed_pos(rect.left_top() + vec2(8.0, 8.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        ui.horizontal(|ui| {
-            for (i, (label, view)) in PRESETS.iter().enumerate() {
-                let on = (st.map.c_lon - view.c_lon).abs() < 1e-9
-                    && (st.map.c_lat - view.c_lat).abs() < 1e-9
-                    && (st.map.span_lon - view.span_lon).abs() < 1e-9;
-                let mut btn = Button::new(i18n::tr(label)).small().widget(format!("geo:map:preset:{i}"));
-                if on {
-                    btn = btn.primary();
-                }
-                if btn.show(ui).clicked() {
-                    st.map = *view;
-                    st.map_sel = None;
-                }
-            }
-        });
-    });
-    egui::Area::new(Id::unique("geo-map-zoom")).fixed_pos(pos2(rect.right() - 104.0, rect.top() + 8.0)).order(egui::Order::Foreground).show(
+    let preset_width: f32 =
+        PRESETS.iter().map(|(label, _)| Button::new(i18n::tr(label)).small().desired_size(ui).x + ui.spacing().item_spacing.x).sum();
+    let stacked = preset_width + 120.0 > rect.width();
+    let presets = egui::Area::new(Id::unique("geo-map-chips")).fixed_pos(rect.left_top() + vec2(8.0, 8.0)).order(egui::Order::Foreground).show(
         ui.ctx(),
         |ui| {
-            ui.horizontal(|ui| {
-                let zoom = |st: &mut State, factor: f64, rect: Rect| {
-                    let at = (st.map.c_lat, st.map.c_lon);
-                    st.map = zoom_around(st.map, factor, at, rect);
-                    clamp_view(&mut st.map);
-                };
-                if Button::icon_only(icons::Icon::Plus, "Zoom in").small().widget("geo:map:zoomin").show(ui).clicked() {
-                    zoom(st, 1.5, rect);
-                }
-                if Button::icon_only(icons::Icon::Minus, "Zoom out").small().widget("geo:map:zoomout").show(ui).clicked() {
-                    zoom(st, 1.0 / 1.5, rect);
-                }
-                if Button::icon_only(icons::Icon::Target, "Reset view").small().widget("geo:map:home").show(ui).clicked() {
-                    st.map = NATIONAL;
-                    st.map_sel = None;
+            ui.set_width((rect.width() - 16.0).max(1.0));
+            ui.horizontal_wrapped(|ui| {
+                for (i, (label, view)) in PRESETS.iter().enumerate() {
+                    let on = (st.map.c_lon - view.c_lon).abs() < 1e-9
+                        && (st.map.c_lat - view.c_lat).abs() < 1e-9
+                        && (st.map.span_lon - view.span_lon).abs() < 1e-9;
+                    let mut btn = Button::new(i18n::tr(label)).small().widget(format!("geo:map:preset:{i}"));
+                    if on {
+                        btn = btn.primary();
+                    }
+                    if btn.show(ui).clicked() {
+                        st.map = *view;
+                        st.map_sel = None;
+                    }
                 }
             });
         },
     );
+    // Presets wrap in a narrow dock. Keep zoom below that row so both remain clickable.
+    let zoom_y = if stacked { presets.response.rect.bottom() + 6.0 } else { rect.top() + 8.0 };
+    egui::Area::new(Id::unique("geo-map-zoom")).fixed_pos(pos2(rect.right() - 104.0, zoom_y)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+        ui.horizontal(|ui| {
+            let zoom = |st: &mut State, factor: f64, rect: Rect| {
+                let at = (st.map.c_lat, st.map.c_lon);
+                st.map = zoom_around(st.map, factor, at, rect);
+                clamp_view(&mut st.map);
+            };
+            if Button::icon_only(icons::Icon::Plus, "Zoom in").small().widget("geo:map:zoomin").show(ui).clicked() {
+                zoom(st, 1.5, rect);
+            }
+            if Button::icon_only(icons::Icon::Minus, "Zoom out").small().widget("geo:map:zoomout").show(ui).clicked() {
+                zoom(st, 1.0 / 1.5, rect);
+            }
+            if Button::icon_only(icons::Icon::Target, "Reset view").small().widget("geo:map:home").show(ui).clicked() {
+                st.map = NATIONAL;
+                st.map_sel = None;
+            }
+        });
+    });
 }

@@ -206,12 +206,93 @@ fn search_page_registers_actions_and_preserves_user_captions() {
     let _ = view.run(input, |ui| super::draw(&mut app, ui, &mut state));
     let registered: Vec<_> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().map(|(id, _)| id).collect();
     assert!(registered.iter().any(|id| id == "semantic:query"));
-    assert!(registered.iter().any(|id| id == "semantic:index"));
+    assert!(registered.iter().any(|id| id == "semantic:advanced"));
+    assert!(!registered.iter().any(|id| id == "semantic:index"));
     assert!(registered.iter().any(|id| id == "semantic:search"));
     for (id, caption) in before {
         assert_eq!(app.session.catalog.photo(id).unwrap().meta.caption, caption);
     }
     assert!(crate::hub::features().iter().any(|f| f.id == super::PAGE_ID));
+}
+
+fn draw_page(
+    app: &mut LightcraftApp,
+    view: &mut lightcraft_ui_egui::headless::HeadlessView,
+    state: &mut super::State,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> std::collections::HashMap<String, egui::Rect> {
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1., 0., events);
+    let _ = view.run(input, |ui| super::draw(app, ui, state));
+    lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().collect()
+}
+
+fn click_page(
+    app: &mut LightcraftApp,
+    view: &mut lightcraft_ui_egui::headless::HeadlessView,
+    state: &mut super::State,
+    size: egui::Vec2,
+    pos: egui::Pos2,
+) -> std::collections::HashMap<String, egui::Rect> {
+    let event = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    draw_page(app, view, state, size, vec![egui::Event::PointerMoved(pos), event(true)]);
+    draw_page(app, view, state, size, vec![event(false)])
+}
+
+#[test]
+fn search_footer_stays_visible_and_advanced_controls_toggle_at_narrow_widths() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    for width in [270., 440.] {
+        let size = egui::vec2(width, 780.);
+        let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+        let mut state = super::State { minimum: 0.4, ..Default::default() };
+        let widgets = draw_page(&mut app, &mut view, &mut state, size, vec![]);
+        let footer = widgets["semantic:search"];
+        assert!(footer.top() >= size.y - 66. && footer.bottom() <= size.y);
+        assert!(widgets["semantic:query"].bottom() < footer.top());
+        for id in ["semantic:index", "semantic:download", "semantic:minimum", "semantic:show"] {
+            assert!(!widgets.contains_key(id), "{id} should not clutter the initial page");
+        }
+        let text = view.painted_text().join("\n");
+        assert!(!text.contains("Semantic Photo Search"), "the host already supplies the title");
+        assert!(!text.contains("0 search results") && !text.contains("0 updated"));
+        click_page(&mut app, &mut view, &mut state, size, widgets["semantic:advanced"].center());
+        assert!(state.advanced);
+        let widgets = draw_page(&mut app, &mut view, &mut state, size, vec![]);
+        assert_eq!(widgets["semantic:search"], footer, "expanding settings must not move the primary action");
+        for id in ["semantic:index", "semantic:download", "semantic:minimum"] {
+            let rect = widgets[id];
+            assert!(rect.left() >= 0. && rect.right() <= width && rect.bottom() < footer.top(), "{id}: {rect:?}");
+        }
+        click_page(&mut app, &mut view, &mut state, size, widgets["semantic:advanced"].center());
+        assert!(!state.advanced);
+        let widgets = draw_page(&mut app, &mut view, &mut state, size, vec![]);
+        assert!(!widgets.contains_key("semantic:index"));
+    }
+}
+
+#[test]
+fn compact_search_results_keep_selection_and_library_filter_actions() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    let ids: Vec<_> = app.session.catalog.photos().take(2).map(|p| p.id.0).collect();
+    let size = egui::vec2(270., 780.);
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let mut state = super::State { searched: true, ..Default::default() };
+    state.reply.hits = ids.iter().map(|&id| worker::Hit { id, text: "A dog running through a field. ".repeat(40), semantic: Some(0.789) }).collect();
+    let widgets = draw_page(&mut app, &mut view, &mut state, size, vec![]);
+    let footer = widgets["semantic:search"];
+    assert!(widgets["semantic:show"].bottom() < footer.top());
+    assert!(!view.painted_text().join("\n").contains("0.789"), "scores belong in the tooltip");
+    for id in &ids {
+        let rect = widgets[&format!("semantic:photo:{id}")];
+        assert!(rect.right() <= size.x && rect.bottom() < footer.top(), "a long description must not push the next result away");
+    }
+    click_page(&mut app, &mut view, &mut state, size, widgets[&format!("semantic:photo:{}", ids[1])].center());
+    assert_eq!(app.session.selection.active.map(|id| id.0), Some(ids[1]));
+    click_page(&mut app, &mut view, &mut state, size, widgets["semantic:show"].center());
+    let visible: Vec<_> = app.session.visible().iter().map(|id| id.0).collect();
+    assert_eq!(visible.len(), ids.len());
+    assert!(ids.iter().all(|id| visible.contains(id)));
 }
 
 #[test]

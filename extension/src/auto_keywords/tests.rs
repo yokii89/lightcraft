@@ -701,6 +701,100 @@ fn the_page_survives_a_run_against_a_dead_service() {
     assert_eq!(st.settings.model_repo(), config::MODEL_DEFAULT);
 }
 
+fn settings_frame(
+    app: &mut LightcraftApp,
+    view: &mut lightcraft_ui_egui::headless::HeadlessView,
+    state: &mut State,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> std::collections::HashMap<String, egui::Rect> {
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(size, 1., view.frames() as f64 / 10., events);
+    let _ = view.run(input, |ui| super::draw(app, ui, state));
+    lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().collect()
+}
+
+fn click_setting(app: &mut LightcraftApp, view: &mut lightcraft_ui_egui::headless::HeadlessView, state: &mut State, size: egui::Vec2, id: &str) {
+    let widgets = settings_frame(app, view, state, size, vec![]);
+    let pos = widgets[id].center();
+    for pressed in [true, false] {
+        settings_frame(
+            app,
+            view,
+            state,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+            ],
+        );
+    }
+}
+
+#[test]
+fn compact_keyword_settings_keep_modes_visible_and_fold_naming_details() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    for width in [270., 440.] {
+        let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+        let mut state = State::default();
+        let size = vec2(width, 780.);
+        let widgets = settings_frame(&mut app, &mut view, &mut state, size, vec![]);
+        let footer = widgets["akw:generate"];
+        assert!(footer.top() >= size.y - 66.);
+        assert!(!widgets.contains_key("akw:parent") && !widgets.contains_key("akw:python"));
+        assert!(widgets["akw:mode:direct"].bottom() < 510., "the ordinary options fit without scrolling");
+        let text = view.painted_text().join("\n");
+        assert!(!text.contains("The model is not running") && !text.contains("The categories are fixed"));
+        for (id, mode) in [("akw:mode:direct", ApplyMode::Direct), ("akw:mode:review", ApplyMode::Review)] {
+            click_setting(&mut app, &mut view, &mut state, size, id);
+            assert_eq!(state.settings.apply_mode, mode);
+            assert!(state.save_at.is_some(), "write-mode changes still persist");
+        }
+        click_setting(&mut app, &mut view, &mut state, size, "akw:options");
+        assert!(state.options);
+        let widgets = settings_frame(&mut app, &mut view, &mut state, size, vec![]);
+        assert!(widgets.contains_key("akw:parent"));
+        assert!(widgets["akw:parent"].right() <= width);
+        assert_eq!(widgets["akw:generate"], footer);
+        click_setting(&mut app, &mut view, &mut state, size, "akw:options");
+        assert!(!state.options);
+    }
+}
+
+#[test]
+fn failed_model_has_one_service_card_with_a_visible_reason_and_retry() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let mut state = State::default();
+    state.service.phase = super::server::Phase::Failed;
+    state.service.cause = super::server::Cause::Error("The interpreter could not start".into());
+    let widgets = settings_frame(&mut app, &mut view, &mut state, vec2(270., 780.), vec![]);
+    let text = view.painted_text().join("\n");
+    assert_eq!(text.matches("Model service").count(), 1);
+    assert!(text.contains("The interpreter could not start"));
+    assert!(widgets.contains_key("akw:service:retry") && !widgets.contains_key("akw:service:start"));
+    assert!(!text.contains("pip install"), "diagnostics stay in Advanced");
+}
+
+#[test]
+fn long_review_descriptions_leave_photo_and_keyword_choices_reachable() {
+    let (mut app, id) = demo();
+    let mut state = state_with(id, vec!["mountain", "lake"]);
+    state.phase = Phase::Review;
+    state.results[0].description = "A mountain reflected in a lake. ".repeat(100);
+    let mut second = state.results[0].clone();
+    second.id = app.session.catalog.photos().find(|p| p.id != id).unwrap().id;
+    let second_id = second.id;
+    state.results.push(second);
+    let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+    let size = vec2(270., 780.);
+    let widgets = settings_frame(&mut app, &mut view, &mut state, size, vec![]);
+    assert!(widgets[&format!("akw:include:{}", second_id.0)].bottom() < 400., "long descriptions must not expand the rows");
+    click_setting(&mut app, &mut view, &mut state, size, &format!("akw:include:{}", id.0));
+    assert_eq!(state.review_counts().0, 1);
+    click_setting(&mut app, &mut view, &mut state, size, &format!("akw:chip:{}:lake", second_id.0));
+    assert_eq!(state.review_counts(), (1, 1));
+}
+
 #[test]
 fn switching_libraries_discards_the_previous_analysis_results() {
     let (app, id) = demo();

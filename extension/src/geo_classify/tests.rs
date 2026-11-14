@@ -608,16 +608,13 @@ fn the_page_renders_headless_and_names_the_dataset_state() {
     let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(360.0, 780.0), 1.0, 0.0, vec![]);
     let _ = view.run(input, |ui| page(&mut app, ui));
     let text = view.painted_text().join("\n");
-    assert!(text.contains("Place names"), "the dataset card: {text}");
-    assert!(
-        text.contains("Not downloaded") || text.contains("Ready"),
-        "the page names the dataset state (a machine may already hold the dataset): {text}"
-    );
+    let ready = super::dataset_ready(lock().status.as_ref());
+    assert!(ready || text.contains("Not downloaded"), "missing place names are actionable: {text}");
     assert!(text.contains("CC-BY 4.0"), "the GeoNames attribution is shown: {text}");
     let registered: Vec<(String, egui::Rect)> = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
     assert!(
-        registered.iter().any(|(id, _)| id == "geo:download" || id == "geo:recheck"),
-        "the dataset action (download or re-check): {registered:?}"
+        registered.iter().any(|(id, _)| id == if ready { "geo:advanced" } else { "geo:download" }),
+        "download is visible when needed; maintenance lives in settings: {registered:?}"
     );
     assert!(registered.iter().any(|(id, _)| id == "geo:start"), "the start action is in the sticky footer: {registered:?}");
 }
@@ -662,8 +659,8 @@ fn the_album_card_renders_the_stored_album_headless() {
     let _ = view.run(input, |ui| page(&mut app, ui));
     let text = view.painted_text().join("\n");
     assert!(text.contains("Map album"), "the album card: {text}");
-    assert!(text.contains("2 in the album"), "both album photos are counted: {text}");
-    assert!(text.contains("1 to write"), "the already-keyworded photo is not pending: {text}");
+    assert!(text.contains("2 photos"), "both album photos are counted once in the header: {text}");
+    assert!(text.contains("Write keywords (1 photos)"), "the footer counts only pending photos: {text}");
     let registered = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
     assert!(registered.iter().any(|(id, _)| id == "geo:map"), "the album map is registered for automation");
     assert!(registered.iter().any(|(id, _)| id == "geo:map:bubble:0"), "the album's places are on the map");
@@ -671,6 +668,49 @@ fn the_album_card_renders_the_stored_album_headless() {
     assert!(registered.iter().any(|(id, _)| id == "geo:map:city"), "the album map exposes a city filter");
     assert!(registered.iter().any(|(id, _)| id == "geo:map:viewport"), "the album map exposes its current viewport action");
     assert!(registered.iter().any(|(id, _)| id == "geo:start"), "the write action is in the sticky footer");
+    *lock() = State::default();
+}
+
+#[test]
+fn compact_album_puts_the_map_first_and_discloses_optional_tools() {
+    let _page = super::page_test_lock();
+    let (mut app, id, _) = demo();
+    for width in [270., 440.] {
+        album_state(&app, vec![place_at(id.0, "photo.jpg", "中国", "杭州", "CN", 30.3, 120.2)]);
+        lock().status = Some(serde_json::json!({"downloaded": true}));
+        let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
+        let size = vec2(width, 960.);
+        page_frame(&mut view, &mut app, size, vec![]);
+        page_frame(&mut view, &mut app, size, vec![]);
+        let widgets: std::collections::HashMap<_, _> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().collect();
+        let footer = widgets["geo:start"];
+        assert!(widgets["geo:map"].top() < 90., "the map should precede dataset and keyword configuration");
+        assert!(footer.top() >= size.y - 66.);
+        for id in ["geo:parent", "geo:recheck", "geo:track:add"] {
+            assert!(!widgets.contains_key(id), "{id} is optional setup");
+        }
+        for id in ["geo:map:search", "geo:map:country", "geo:map:city", "geo:map:viewport", "geo:map:enterFullscreen"] {
+            assert!(widgets[id].left() >= 0. && widgets[id].right() <= width, "{id} fits a narrow column");
+        }
+        for zoom in ["geo:map:zoomin", "geo:map:zoomout", "geo:map:home"] {
+            for index in 0..4 {
+                assert!(!widgets[zoom].intersects(widgets[&format!("geo:map:preset:{index}")]), "zoom and presets must not overlap");
+            }
+        }
+        assert!(view.painted_text().join("\n").contains("CC-BY 4.0"), "attribution stays visible");
+        click_page_widget(&mut view, &mut app, size, "geo:tracks");
+        assert!(lock().tracks_open);
+        let widgets = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+        assert!(widgets.iter().any(|(id, _)| id == "geo:track:add"));
+        click_page_widget(&mut view, &mut app, size, "geo:tracks");
+        assert!(!lock().tracks_open);
+        click_page_widget(&mut view, &mut app, size, "geo:advanced");
+        assert!(lock().advanced);
+        let widgets: std::collections::HashMap<_, _> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().collect();
+        assert!(widgets.contains_key("geo:parent") && widgets.contains_key("geo:recheck"));
+        assert!(widgets["geo:parent"].right() <= width);
+        assert_eq!(widgets["geo:start"], footer);
+    }
     *lock() = State::default();
 }
 
@@ -841,14 +881,21 @@ fn the_album_lists_track_actions_and_a_selection_count() {
     *lock() = State {
         loaded_gen: Some(app.session.library_generation()),
         tracks: vec![TrackOverlay { path: "trip.gpx".to_string(), name: "trip.gpx".to_string(), log: std::sync::Arc::new(log) }],
+        tracks_open: true,
         ..State::default()
     };
     let mut view = lightcraft_ui_egui::headless::HeadlessView::new();
-    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(520.0, 900.0), 1.0, 0.0, vec![]);
+    let input = lightcraft_ui_egui::headless::HeadlessView::raw_input(vec2(270.0, 900.0), 1.0, 0.0, vec![]);
     let _ = view.run(input, |ui| page(&mut app, ui));
     let text = view.painted_text().join("\n");
     assert!(text.contains("trip.gpx · 2 points"), "the imported track is listed: {text}");
-    let ids: Vec<String> = lightcraft_ui_egui::widgets::take_registry(&view.ctx).into_iter().map(|(id, _)| id).collect();
+    let registry = lightcraft_ui_egui::widgets::take_registry(&view.ctx);
+    for (id, rect) in &registry {
+        if id.starts_with("geo:track:") {
+            assert!(rect.left() >= 0. && rect.right() <= 270., "{id} must remain inside the narrow panel: {rect:?}");
+        }
+    }
+    let ids: Vec<String> = registry.into_iter().map(|(id, _)| id).collect();
     assert!(ids.iter().any(|id| id == "geo:track:add"), "the album can add another GPX track");
     assert!(ids.iter().any(|id| id == "geo:track:focus:0"), "the route can be framed");
     assert!(ids.iter().any(|id| id == "geo:track:match:0"), "the selected photos can be time-matched");

@@ -1,15 +1,15 @@
 //! Small drawing helpers shared by the extension pages: the card and its head, the status pill,
-//! the scope segments, the option cards, the path example, the stepper, the sticky action bar and
+//! the scope segments, disclosures, the path example, the stepper, the sticky action bar and
 //! the success card. Everything draws in the native look ([`Tokens`], so every theme works) and
 //! registers its own widget ids where a caller can press it.
 
-use egui::{Align2, Color32, Key, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use lightcraft_catalog::PhotoId;
 use lightcraft_ui_egui::button::Button;
 use lightcraft_ui_egui::icons::{self, Icon};
 use lightcraft_ui_egui::panels::grid::request_thumb;
 use lightcraft_ui_egui::theme::{Tokens, current};
-use lightcraft_ui_egui::{LightcraftApp, i18n, widgets};
+use lightcraft_ui_egui::{LightcraftApp, i18n};
 
 /// Translate a source string with `{name}` placeholders filled in (the placeholders travel in the
 /// translation, so the word order is each language's own).
@@ -116,6 +116,20 @@ pub fn warning(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(t.font(10.5)).color(t.caution));
 }
 
+/// A quiet, registered disclosure shared by settings and optional tools.
+pub fn disclosure(ui: &mut Ui, title: &str, open: &mut bool, widget: &str) -> bool {
+    let chevron = if *open { Icon::ChevronDown } else { Icon::ChevronRight };
+    if Button::new(i18n::tr(title)).icon(chevron).ghost().small().widget(widget).show(ui).clicked() {
+        *open = !*open;
+    }
+    if *open {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+    }
+    *open
+}
+
 /// The body and the sticky action bar of a page: consumes all of `ui`'s remaining height, leaving
 /// `footer_h` at the bottom when there is room for both. `None` means the body has it all.
 pub fn split_page(ui: &mut Ui, footer_h: f32) -> (Rect, Option<Rect>) {
@@ -165,57 +179,6 @@ pub fn action_note(ui: &mut Ui, text: &str) {
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(text).font(t.font(9.5)).color(t.text_dim));
     });
-}
-
-/// One radio option card: the whole card is the click; a radio, a title and a description.
-pub fn option_card(ui: &mut Ui, selected: bool, title: &str, description: &str, widget: &str) -> bool {
-    let t = Tokens::get(ui.ctx());
-    let title = i18n::tr(title).to_string();
-    let description = i18n::tr(description).to_string();
-    let width = ui.available_width();
-    let text_w = (width - 42.0).max(24.0);
-    let galley = ui.painter().layout(description, t.font(10.5), t.text_dim, text_w);
-    let height = (9.0 + 15.0 + 2.0 + galley.size().y + 9.0).max(44.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let response = ui.interact(rect, ui.scope_id().with(("ext-option", widget)), Sense::click());
-    widgets::register(ui, widget, rect);
-    let activated = response.clicked() || (response.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space)));
-    let fill = if selected {
-        t.canvas.lerp_to_gamma(t.accent, 0.12)
-    } else if response.hovered() {
-        t.canvas.lerp_to_gamma(t.hover, 0.35)
-    } else {
-        t.canvas
-    };
-    let border = if selected {
-        t.accent
-    } else if response.hovered() {
-        t.button_border
-    } else {
-        t.field_border
-    };
-    let p = ui.painter();
-    p.rect_filled(rect, 5.0, fill);
-    p.rect_stroke(rect, 5.0, Stroke::new(1.0, border), StrokeKind::Inside);
-    if response.has_focus() {
-        p.rect_stroke(rect.expand(2.0), 7.0, Stroke::new(2.0, t.accent), StrokeKind::Outside);
-    }
-    let centre = pos2(rect.left() + 16.5, rect.top() + 15.5);
-    p.circle_stroke(centre, 6.5, Stroke::new(1.0, if selected { t.accent } else { t.field_border }));
-    if selected {
-        p.circle_filled(centre, 3.0, t.accent);
-    }
-    p.text(
-        pos2(rect.left() + 29.0, rect.top() + 9.0),
-        Align2::LEFT_TOP,
-        title.clone(),
-        t.semibold(11.5),
-        if selected { t.text } else { t.text_label },
-    );
-    p.galley(pos2(rect.left() + 29.0, rect.top() + 26.0), galley, t.text_dim);
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, ui.is_enabled(), selected, title.clone()));
-    ui.add_space(6.0);
-    activated
 }
 
 /// A compact number stepper: minus, the value, plus.

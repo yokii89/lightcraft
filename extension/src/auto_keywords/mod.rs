@@ -26,7 +26,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use egui::{Align, Rect, RichText, Sense, Stroke, Ui, vec2};
+use egui::{Align, Rect, RichText, Sense, Ui, vec2};
 use lightcraft_catalog::{Meta, Op, PhotoId};
 use lightcraft_codecs::{ChromaSubsampling, EncodeImage, EncodeMeta, encode_jpeg};
 use lightcraft_engine::RenderJob;
@@ -35,7 +35,7 @@ use lightcraft_engine::activity::{Cancel, TaskGuard};
 use lightcraft_engine::catalog::keywords;
 use lightcraft_engine::cmd::keywords as keywords_cmd;
 use lightcraft_ui_egui::button::Button;
-use lightcraft_ui_egui::icons::{self, Icon};
+use lightcraft_ui_egui::icons::Icon;
 use lightcraft_ui_egui::progress::{fraction_of, spinner};
 use lightcraft_ui_egui::text_field::TextField;
 use lightcraft_ui_egui::theme::Tokens;
@@ -44,8 +44,8 @@ use lightcraft_ui_egui::{LightcraftApp, i18n};
 use serde_json::Value;
 
 use crate::ui::{
-    Pill, action_bar, action_note, card, card_head, field, fmt_seconds, hint, option_card, path_example, photo_placeholder, photo_thumb,
-    primary_action, secondary_action, split_page, status_pill, stepper, success_card, trn, warning, with_alpha,
+    Pill, action_bar, action_note, card, card_head, disclosure, field, fmt_seconds, hint, path_example, photo_placeholder, photo_thumb,
+    primary_action, secondary_action, split_page, status_pill, stepper, success_card, trn, warning,
 };
 use config::ApplyMode;
 
@@ -184,6 +184,8 @@ struct State {
     removed: HashMap<u64, HashSet<String>>,
     /// The model service card's technical fields, folded away until asked for.
     advanced: bool,
+    /// Keyword naming and category details are only needed when changing the defaults.
+    options: bool,
     // the outcome
     applied: Option<Applied>,
     apply_error: Option<String>,
@@ -774,166 +776,73 @@ fn draw(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     });
 }
 
-/// The 28 pt tile before a service status line.
-fn status_tile(ui: &mut Ui, icon: Icon, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 7.0, with_alpha(color, 26));
-    icons::paint(p, rect.shrink(7.0), icon, color);
-}
-
-/// The model service card (§10 idle state): the status pill, the start/stop toggle (懒启动，快释放),
-/// and the technical fields folded away under 「高级」.
+/// Show each service state once; keep diagnostics and resource details under Advanced.
 fn draw_service(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     let status = st.service.clone();
-    if status.phase == server::Phase::Failed {
-        draw_service_failed(app, ui, st);
-    }
     card(ui, |ui| {
         let (pill, kind) = match status.phase {
             server::Phase::Starting => ("Starting up", Pill::Busy),
             server::Phase::Ready => ("Ready", Pill::Ready),
-            _ => ("Not running", Pill::Idle),
+            server::Phase::Failed => ("Failed", Pill::Idle),
+            server::Phase::Stopped => ("Not running", Pill::Idle),
         };
         card_head(ui, Icon::Sliders, "Model service", |ui| status_pill(ui, pill, kind));
-        let t = Tokens::get(ui.ctx());
         match status.phase {
             server::Phase::Starting => {
-                ui.horizontal(|ui| {
-                    spinner(ui, 12.0);
-                    ui.label(RichText::new(i18n::tr("Starting the model service…")).font(t.font(11.5)).color(t.text_label));
-                });
                 hint(ui, i18n::tr("The model downloads on first start; after that it runs on this computer."));
             }
             server::Phase::Ready => {
-                let mut text = i18n::tr("Model ready").to_string();
-                if !status.device.is_empty() {
-                    text.push_str(" · ");
-                    text.push_str(&status.device);
-                }
-                if status.ready_secs > 0 {
-                    text.push_str(" · ");
-                    text.push_str(&fmt_seconds(status.ready_secs as f64));
-                }
-                // stopping the model mid-run would fail every remaining photo
-                let stop_ok = st.phase != Phase::Running;
-                if ui.available_width() >= 340.0 {
-                    ui.horizontal(|ui| {
-                        status_tile(ui, Icon::Check, t.accent);
-                        ui.label(RichText::new(text.clone()).font(t.font(11.5)).color(t.text_label));
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            if Button::new(i18n::tr("Stop the model"))
-                                .secondary()
-                                .small()
-                                .enabled(stop_ok)
-                                .widget("akw:service:stop")
-                                .show(ui)
-                                .clicked()
-                            {
-                                server::stop();
-                            }
-                        });
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        status_tile(ui, Icon::Check, t.accent);
-                        ui.label(RichText::new(text).font(t.font(11.5)).color(t.text_label));
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            if Button::new(i18n::tr("Stop the model"))
-                                .secondary()
-                                .small()
-                                .enabled(stop_ok)
-                                .widget("akw:service:stop")
-                                .show(ui)
-                                .clicked()
-                            {
-                                server::stop();
-                            }
-                        });
-                    });
+                // Stopping the model mid-run would fail every remaining photo.
+                if secondary_action(ui, i18n::tr("Stop the model"), st.phase != Phase::Running, "akw:service:stop") {
+                    server::stop();
                 }
             }
-            server::Phase::Stopped | server::Phase::Failed => {
-                if ui.available_width() >= 340.0 {
-                    ui.horizontal(|ui| {
-                        status_tile(ui, Icon::Info, t.text_dim);
-                        ui.label(RichText::new(i18n::tr("The model is not running")).font(t.font(11.5)).color(t.text_label));
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            if Button::new(i18n::tr("Start the model")).secondary().small().widget("akw:service:start").show(ui).clicked() {
-                                start_service(app, ui.ctx(), st);
-                            }
-                        });
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        status_tile(ui, Icon::Info, t.text_dim);
-                        ui.label(RichText::new(i18n::tr("The model is not running")).font(t.font(11.5)).color(t.text_label));
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                            if Button::new(i18n::tr("Start the model")).secondary().small().widget("akw:service:start").show(ui).clicked() {
-                                start_service(app, ui.ctx(), st);
-                            }
-                        });
-                    });
+            server::Phase::Stopped => {
+                if secondary_action(ui, i18n::tr("Start the model"), true, "akw:service:start") {
+                    start_service(app, ui.ctx(), st);
                 }
+                hint(ui, i18n::tr("First start downloads the model (about 5 GB)."));
             }
+            server::Phase::Failed => draw_service_failed(app, ui, st),
         }
-        match &status.cause {
-            server::Cause::IdleTimeout => hint(
-                ui,
-                &trn(
-                    "It shut itself down after {secs} idle seconds to free the machine; press Start to bring it back.",
-                    &[("secs", config::IDLE_SECS.to_string())],
-                ),
-            ),
-            server::Cause::ManualStop => hint(ui, i18n::tr("Stopped by hand; press Start to bring it back.")),
-            server::Cause::Exited => warning(ui, i18n::tr("The service process is gone.")),
-            // a start failure's reason shows in the failure card above
-            server::Cause::Error(_) | server::Cause::None => {}
+        if status.cause == server::Cause::Exited {
+            warning(ui, i18n::tr("The service process is gone."));
         }
         ui.add_space(6.0);
-        let chevron = if st.advanced { Icon::ChevronDown } else { Icon::ChevronRight };
-        if Button::new(i18n::tr("Advanced")).icon(chevron).ghost().small().widget("akw:advanced").show(ui).clicked() {
-            st.advanced = !st.advanced;
-        }
-        if st.advanced {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            field(ui, "Model", |ui| {
-                let resp = TextField::singleline("akw:model", &mut st.settings.model_repo).hint(config::MODEL_DEFAULT).show(ui);
-                if resp.response.changed() || resp.committed() {
-                    save_soon(st);
-                }
-            });
-            field(ui, "Python interpreter", |ui| {
-                let resp = TextField::singleline("akw:python", &mut st.settings.python_path).hint("python / python3 / py").show(ui);
-                if resp.response.changed() || resp.committed() {
-                    save_soon(st);
-                }
-            });
-            field(ui, "Per-photo timeout (seconds)", |ui| {
-                if ui.add(egui::DragValue::new(&mut st.settings.timeout_secs).range(config::TIMEOUT_MIN..=config::TIMEOUT_MAX).suffix(" s")).changed()
-                {
-                    save_soon(st);
-                }
-            });
-            ui.add_space(2.0);
-            hint(
-                ui,
-                &trn(
-                    "Lazy start: the model loads only after Start, and frees itself after {mins} idle minutes. The first start downloads it (about 5 GB).",
-                    &[("mins", (config::IDLE_SECS / 60).to_string())],
-                ),
-            );
-            hint(ui, i18n::tr("Images are sent only to the local service on this computer (127.0.0.1)."));
+        if disclosure(ui, "Advanced", &mut st.advanced, "akw:advanced") {
+            draw_service_settings(ui, st);
         }
     });
+}
+
+fn draw_service_settings(ui: &mut Ui, st: &mut State) {
+    let t = Tokens::get(ui.ctx());
+    let mut changed = false;
+    for (label, widget, value, placeholder) in [
+        ("Model", "akw:model", &mut st.settings.model_repo, config::MODEL_DEFAULT),
+        ("Python interpreter", "akw:python", &mut st.settings.python_path, "python / python3 / py"),
+    ] {
+        ui.label(RichText::new(i18n::tr(label)).font(t.font(11.0)).color(t.text_dim));
+        let response = TextField::singleline(widget, value).hint(placeholder).width(ui.available_width()).show(ui);
+        changed |= response.response.changed() || response.committed();
+        ui.add_space(4.0);
+    }
+    ui.label(RichText::new(i18n::tr("Per-photo timeout (seconds)")).font(t.font(11.0)).color(t.text_dim));
+    changed |= ui.add(egui::DragValue::new(&mut st.settings.timeout_secs).range(config::TIMEOUT_MIN..=config::TIMEOUT_MAX).suffix(" s")).changed();
+    if changed {
+        save_soon(st);
+    }
+    if !st.service.device.is_empty() {
+        hint(ui, &st.service.device);
+    }
+    ui.add_space(4.0);
+    hint(ui, &trn("Releases the model after {mins} idle minutes.", &[("mins", (config::IDLE_SECS / 60).to_string())]));
+    if st.service.phase == server::Phase::Failed {
+        for line in server::stderr_tail() {
+            hint(ui, &line);
+        }
+        hint(ui, i18n::tr("Missing Python or the dependencies? Run: pip install -r extension/server/requirements.txt"));
+    }
 }
 
 /// Start the model service (the toggle's on half): the settings as they are now govern the spawn.
@@ -944,39 +853,20 @@ fn start_service(app: &mut LightcraftApp, ctx: &egui::Context, st: &mut State) {
     }
 }
 
-/// The service failure card (§10 fail state): the reason, the service's last stderr lines, how to
-/// install the requirements — above the settings, so the fix and the retry are one glance apart.
+/// A service failure stays in its service card; logs and setup help live under Advanced.
 fn draw_service_failed(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
-    let cause = st.service.cause.clone();
-    let tail = server::stderr_tail();
-    card(ui, |ui| {
-        let t = Tokens::get(ui.ctx());
-        card_head(ui, Icon::Info, "Model service", |ui| status_pill(ui, "Failed", Pill::Idle));
-        ui.label(RichText::new(i18n::tr("Could not start the model service")).font(t.semibold(12.0)).color(t.text));
-        ui.add_space(4.0);
-        let reason = match &cause {
-            server::Cause::Error(e) => e.clone(),
-            _ => String::new(),
-        };
-        if !reason.is_empty() {
-            ui.label(RichText::new(reason).font(t.font(11.0)).color(t.text_label));
-        }
-        for line in &tail {
-            ui.label(RichText::new(line).font(t.font(10.0)).color(t.text_dim));
-        }
-        ui.add_space(8.0);
-        if Button::new(i18n::tr("Try again")).secondary().small().widget("akw:service:retry").show(ui).clicked() {
-            start_service(app, ui.ctx(), st);
-        }
-        ui.add_space(8.0);
-        hint(ui, i18n::tr("Missing Python or the dependencies? Run: pip install -r extension/server/requirements.txt"));
-        ui.add_space(4.0);
-        warning(ui, i18n::tr("Images are sent only to the local service on this computer (127.0.0.1)."));
-    });
+    if let server::Cause::Error(reason) = &st.service.cause {
+        warning(ui, reason);
+    } else {
+        warning(ui, i18n::tr("Could not start the model service"));
+    }
+    ui.add_space(6.0);
+    if secondary_action(ui, i18n::tr("Try again"), true, "akw:service:retry") {
+        start_service(app, ui.ctx(), st);
+    }
 }
 
-/// The settings page (§10 idle state): model service, scope, keywords, write mode. The one main
-/// action lives in the sticky footer.
+/// Keep scope, keyword count and write mode visible; fold naming details away.
 fn draw_settings(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     draw_service(app, ui, st);
     let (selected, view, library) = counts(app, st);
@@ -985,7 +875,7 @@ fn draw_settings(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
         if let Some(scope) = scope::selector(ui, st.scope, (selected, view, library)) {
             st.scope = scope;
         }
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         if ui.checkbox(&mut st.settings.skip_tagged, i18n::tr("Skip photos that already have keywords")).changed() {
             save_soon(st);
         }
@@ -997,38 +887,32 @@ fn draw_settings(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
                 save_soon(st);
             }
         });
-        field(ui, "Parent keyword", |ui| {
-            let resp = TextField::singleline("akw:parent", &mut st.settings.parent).hint(config::PARENT_DEFAULT).width(120.0).show(ui);
-            if resp.response.changed() || resp.committed() {
+        let t = Tokens::get(ui.ctx());
+        ui.add_space(4.0);
+        ui.label(RichText::new(i18n::tr("Write mode")).font(t.font(11.0)).color(t.text_dim));
+        for (mode, label, id, tooltip) in [
+            (ApplyMode::Review, "Review before applying", "akw:mode:review", "Review the keywords, then write the whole batch."),
+            (ApplyMode::Direct, "Apply immediately", "akw:mode:direct", "Write when the run ends; one undo step."),
+        ] {
+            let response = ui.radio_value(&mut st.settings.apply_mode, mode, i18n::tr(label));
+            widgets::register(ui, id, response.rect);
+            if response.changed() {
                 save_soon(st);
             }
-        });
-        let parent = if st.settings.parent.trim().is_empty() { i18n::tr("Category").to_string() } else { st.settings.parent.trim().to_string() };
-        let category = prompt::CATEGORIES.get(2).copied().unwrap_or("风景");
-        path_example(ui, &[parent.as_str(), category, "雪山"]);
-        hint(ui, &format!("{}: {}", i18n::tr("The categories are fixed"), prompt::CATEGORIES.join(" / ")));
-    });
-    card(ui, |ui| {
-        card_head(ui, Icon::Check, "Write mode", |_| {});
-        if option_card(
-            ui,
-            st.settings.apply_mode == ApplyMode::Review,
-            "Review before applying",
-            "Review the keywords, then write the whole batch.",
-            "akw:mode:review",
-        ) {
-            st.settings.apply_mode = ApplyMode::Review;
-            save_soon(st);
+            response.on_hover_text(i18n::tr(tooltip));
         }
-        if option_card(
-            ui,
-            st.settings.apply_mode == ApplyMode::Direct,
-            "Apply immediately",
-            "Write when the run ends; one undo step.",
-            "akw:mode:direct",
-        ) {
-            st.settings.apply_mode = ApplyMode::Direct;
-            save_soon(st);
+        ui.add_space(6.0);
+        if disclosure(ui, "More options", &mut st.options, "akw:options") {
+            ui.label(RichText::new(i18n::tr("Parent keyword")).font(t.font(11.0)).color(t.text_dim));
+            let response =
+                TextField::singleline("akw:parent", &mut st.settings.parent).hint(config::PARENT_DEFAULT).width(ui.available_width()).show(ui);
+            if response.response.changed() || response.committed() {
+                save_soon(st);
+            }
+            let parent = if st.settings.parent.trim().is_empty() { i18n::tr("Category").to_string() } else { st.settings.parent.trim().to_string() };
+            let category = prompt::CATEGORIES.get(2).copied().unwrap_or("风景");
+            path_example(ui, &[parent.as_str(), category, "雪山"]);
+            hint(ui, &format!("{}: {}", i18n::tr("The categories are fixed"), prompt::CATEGORIES.join(" / ")));
         }
     });
 }
@@ -1105,40 +989,23 @@ fn draw_running(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
             let recent: Vec<PhotoResult> = st.results.iter().rev().take(3).cloned().collect();
             let mut budget = 6u32;
             for r in &recent {
-                photo_row(app, ui, st, r, false, false, &mut budget);
+                photo_row(app, ui, st, r, false, &mut budget);
+                ui.add_space(4.0);
             }
         });
     }
-    hint(ui, i18n::tr("Progress also shows in the activity stack; closing this panel does not stop the task."));
 }
 
 /// One photo's row: thumbnail, name and the category + keyword chips. In the review the chips are
 /// removable and a checkbox leaves the photo out; elsewhere it is a plain summary line.
-fn photo_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, r: &PhotoResult, editable: bool, framed: bool, budget: &mut u32) {
-    if framed {
-        let t = Tokens::get(ui.ctx());
-        egui::Frame::NONE
-            .fill(t.inset)
-            .stroke(Stroke::new(1.0, t.field_border.gamma_multiply(0.82)))
-            .corner_radius(6)
-            .inner_margin(egui::Margin::same(8))
-            .outer_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 6 })
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                photo_row_body(app, ui, st, r, editable, budget);
-            });
-    } else {
-        photo_row_body(app, ui, st, r, editable, budget);
-        ui.add_space(4.0);
-    }
-}
-
-fn photo_row_body(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, r: &PhotoResult, editable: bool, budget: &mut u32) {
+fn photo_row(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, r: &PhotoResult, editable: bool, budget: &mut u32) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
         if editable {
             let mut on = !st.excluded.contains(&r.id.0);
-            if ui.checkbox(&mut on, "").changed() {
+            let response = ui.checkbox(&mut on, "");
+            widgets::register(ui, format!("akw:include:{}", r.id.0), response.rect);
+            if response.changed() {
                 if on {
                     st.excluded.remove(&r.id.0);
                 } else {
@@ -1149,9 +1016,9 @@ fn photo_row_body(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State, r: &Phot
         let (thumb, _) = ui.allocate_exact_size(vec2(38.0, 26.0), Sense::hover());
         photo_thumb(app, ui, thumb, r.id.0, budget);
         ui.vertical(|ui| {
-            ui.label(RichText::new(&r.name).font(t.font(10.5)).color(t.text));
+            ui.add(egui::Label::new(RichText::new(&r.name).font(t.font(10.5)).color(t.text)).truncate()).on_hover_text(&r.name);
             if !r.description.is_empty() {
-                ui.label(RichText::new(&r.description).font(t.font(10.5)).color(t.text_dim));
+                ui.add(egui::Label::new(RichText::new(&r.description).font(t.font(10.5)).color(t.text_dim)).truncate()).on_hover_text(&r.description);
             }
             chips(ui, st, r.id.0, &r.category, &r.keywords, editable);
         });
@@ -1168,7 +1035,7 @@ fn chips(ui: &mut Ui, st: &mut State, id: u64, category: &str, list: &[String], 
         ui.label(RichText::new("·").font(t.font(9.5)).color(t.text_dim));
         for kw in list {
             let off = st.removed.get(&id).is_some_and(|off| off.contains(&kw.to_lowercase()));
-            let mut text = RichText::new(format!("{kw}  ×")).font(t.font(9.5));
+            let mut text = RichText::new(if editable { format!("{kw}  ×") } else { kw.clone() }).font(t.font(9.5));
             text = if off { text.strikethrough().weak() } else { text };
             let response = ui.add_enabled(editable, egui::Button::new(text).small());
             widgets::register(ui, format!("akw:chip:{id}:{kw}"), response.rect);
@@ -1218,9 +1085,16 @@ fn draw_review(app: &mut LightcraftApp, ui: &mut Ui, st: &mut State) {
     });
     let results: Vec<PhotoResult> = st.results.clone();
     let mut budget = 12u32;
-    for r in &results {
-        photo_row(app, ui, st, r, true, true, &mut budget);
-    }
+    card(ui, |ui| {
+        for (index, r) in results.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+            photo_row(app, ui, st, r, true, &mut budget);
+        }
+    });
 }
 
 /// The done page (§10 done state): what was written, the undo, the failures with their retry.
